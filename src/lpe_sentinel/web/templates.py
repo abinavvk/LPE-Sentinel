@@ -5,11 +5,48 @@ Renders a self-contained, responsive, accessible, dark-themed cybersecurity
 interface. Requires zero third-party CDNs, external styles, or scripts.
 """
 
-def render_dashboard_html() -> str:
+import json
+
+# Placeholder in the inline script that receives the initial capability state.
+_INITIAL_CAPABILITIES_TOKEN = "__INITIAL_CAPABILITIES__"
+
+# Capability defaults applied when the dashboard is served from the hosted
+# (serverless) deployment. These are embedded server-side so the UI remains
+# correctly gated even when the /api/status request never completes.
+_HOSTED_INITIAL_CAPABILITIES = {
+    "isHosted": True,
+    "cloudHistory": False,
+    "liveAudit": False,
+}
+
+
+def _json_for_inline_script(value: object) -> str:
+    """
+    Serialize a value for safe embedding inside an inline <script> element.
+
+    Uses JSON serialization (never string interpolation) and escapes the
+    characters that could terminate the script element or open an HTML comment,
+    preventing a value from breaking out of the script context.
+    """
+    return (
+        json.dumps(value)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+
+
+def render_dashboard_html(hosted: bool = False) -> str:
     """
     Return the complete HTML document for the LPE-Sentinel Web Dashboard.
+
+    Args:
+        hosted: When True, embed hosted (serverless) capability defaults so the
+            UI stays gated even if /api/status is unavailable. Defaults to False,
+            so all existing zero-argument callers keep the fully-capable local
+            dashboard behavior.
     """
-    return """<!DOCTYPE html>
+    html = """<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -1441,7 +1478,7 @@ def render_dashboard_html() -> str:
         <button type="button" class="btn btn-outline" id="btn-clear" onclick="resetDashboard()">
           Clear Dashboard
         </button>
-        <p class="control-hint">Executes defensive, read-only audit across standard search paths.</p>
+        <p class="control-hint" id="control-hint">Executes defensive, read-only audit across standard search paths.</p>
       </article>
 
     </section>
@@ -1712,6 +1749,7 @@ def render_dashboard_html() -> str:
     let currentHistoryScanId = null;
     let comparisonData = null;
     let activeComparisonTab = 'ALL';
+    let hostedCapabilities = __INITIAL_CAPABILITIES__;
 
     function setSessionStatus(stateClass, label) {
       const pill = document.getElementById('session-status');
@@ -1795,6 +1833,18 @@ def render_dashboard_html() -> str:
       const container = document.getElementById('history-list');
       const countPill = document.getElementById('history-count-pill');
       if (!container) return;
+
+      // Honest, explicit state for hosted deployments where cloud history is off.
+      // We do not issue the request at all rather than rendering an HTTP error.
+      if (hostedCapabilities && hostedCapabilities.cloudHistory === false) {
+        if (countPill) countPill.textContent = 'Unavailable';
+        container.innerHTML = '<div class="empty-state" style="padding: 1.5rem 1rem;">'
+          + '<p style="color:var(--text-muted);">Cloud audit history is unavailable in the hosted deployment.</p>'
+          + '<p style="font-size:0.8rem; color:var(--text-dim);">Audit history requires persistent local storage, '
+          + 'which a serverless function does not have. Run the CLI or local dashboard on your target Linux host to record history.</p>'
+          + '</div>';
+        return;
+      }
 
       try {
         const res = await fetch('/api/history?limit=10');
@@ -1952,8 +2002,68 @@ def render_dashboard_html() -> str:
       document.getElementById('audit-modal').classList.remove('open');
     }
 
+    // Capability gating for hosted (serverless) deployments.
+    //
+    // `baseline` carries the server-rendered capability defaults, so gating never
+    // depends on /api/status completing. The local server never marks a response
+    // as hosted, so its baseline stays fully capable and local behavior is
+    // unchanged.
+    //
+    // Enforced invariant: a hosted baseline is terminal. When the server rendered
+    // the page with isHosted=true, liveAudit and cloudHistory stay false no matter
+    // what any status payload asserts, so the hosted gate cannot be widened at
+    // runtime. Only a non-hosted (local) baseline is ever fully capable.
+    function resolveHostedCapabilities(payload, baseline) {
+      const base = baseline || { isHosted: false, cloudHistory: true, liveAudit: true };
+      const hosted = !!(payload && payload.deployment && payload.deployment.is_hosted === true);
+      if (!hosted) return base;
+      const caps = (payload && payload.capabilities) || {};
+      // A hosted page can never be promoted to capable, even by a payload that
+      // explicitly sets live_audit/cloud_history to true.
+      const hostedLocked = base.isHosted === true;
+      return {
+        isHosted: true,
+        // Fail closed: absent, non-boolean, or hosted-locked flags disable the feature.
+        cloudHistory: hostedLocked ? false : caps.cloud_history === true,
+        liveAudit: hostedLocked ? false : caps.live_audit === true
+      };
+    }
+
+    function disableElement(el) {
+      if (!el) return;
+      el.disabled = true;
+      el.setAttribute('disabled', 'disabled');
+      el.setAttribute('aria-disabled', 'true');
+      el.style.opacity = '0.5';
+      el.style.cursor = 'not-allowed';
+    }
+
+    function applyHostedCapabilities(caps) {
+      hostedCapabilities = caps;
+
+      if (caps.liveAudit) {
+        const btn = document.getElementById('btn-run-audit');
+        if (btn) btn.disabled = false;
+      } else {
+        disableElement(document.getElementById('btn-run-audit'));
+        disableElement(document.getElementById('compare-select-older'));
+        disableElement(document.getElementById('compare-select-newer'));
+        disableElement(document.getElementById('btn-run-compare'));
+        disableElement(document.getElementById('btn-refresh-history'));
+        const hint = document.getElementById('control-hint');
+        if (hint) {
+          hint.textContent = 'Live auditing is unavailable in the hosted deployment. '
+            + 'Serverless functions cannot scan their own host. Use the CLI locally, or Load Demo Audit to preview simulated results.';
+          hint.style.color = 'var(--severity-med)';
+        }
+      }
+    }
+
     // Fetch Initial System Status on Page Load
     async function initDashboard() {
+      // Start from the server-rendered baseline so a failed or non-OK status
+      // request cannot widen a hosted deployment into full capabilities.
+      let caps = resolveHostedCapabilities(null, hostedCapabilities);
       try {
         const res = await fetch('/api/status');
         if (res.ok) {
@@ -1962,10 +2072,12 @@ def render_dashboard_html() -> str:
           if (data.system_info) {
             updateSystemInfoDisplay(data.system_info);
           }
+          caps = resolveHostedCapabilities(data, hostedCapabilities);
         }
       } catch (err) {
         console.warn('Status fetch error:', err);
       }
+      applyHostedCapabilities(caps);
       loadRecentAudits();
     }
 
@@ -2015,6 +2127,19 @@ def render_dashboard_html() -> str:
     // Run Unified Audit against POST /api/run-audit
     async function runUnifiedAudit() {
       const btn = document.getElementById('btn-run-audit');
+
+      // Guard the action itself, not just the button, so the capability contract
+      // holds even if the control is re-enabled or invoked programmatically.
+      if (hostedCapabilities && hostedCapabilities.liveAudit === false) {
+        showStatusModal(
+          'Live Auditing Unavailable',
+          'Live security auditing is disabled in the hosted deployment. Serverless functions run in an isolated '
+          + 'ephemeral environment and cannot scan the host machine. Load Demo Audit to preview simulated findings, '
+          + 'or run the CLI locally on your target Linux system.'
+        );
+        return;
+      }
+
       if (isAuditRunning || (btn && btn.disabled)) return;
       isAuditRunning = true;
       currentHistoryScanId = null;
@@ -2788,3 +2913,8 @@ def render_dashboard_html() -> str:
 </body>
 </html>
 """
+    initial_capabilities = _HOSTED_INITIAL_CAPABILITIES if hosted else None
+    return html.replace(
+        _INITIAL_CAPABILITIES_TOKEN,
+        _json_for_inline_script(initial_capabilities),
+    )

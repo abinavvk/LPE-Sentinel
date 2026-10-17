@@ -117,12 +117,22 @@ class handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, is_head: bool = False) -> None:
         """Route incoming request paths."""
-        # Check reverse-proxy headers from Vercel edge if available
-        raw_uri = (
-            self.headers.get("x-forwarded-uri")
-            or self.headers.get("x-matched-path")
-            or self.path
-        )
+        # Path recovery:
+        # Vercel documents that a top-level `rewrites` entry "selects which service
+        # handles a request, and the service receives the original path" - only an
+        # explicit `request.path` transform (unused here) changes the path the
+        # runtime observes. `self.path` is therefore authoritative.
+        #
+        # `x-matched-path` is deliberately NOT consulted: Vercel documents it as a
+        # Next.js *response* header, so reading it from request headers cannot be
+        # correct and it previously masked mis-routed requests.
+        #
+        # `x-forwarded-uri` is retained as a defensive override only. Its presence
+        # is not guaranteed by Vercel's documented request headers, so remaining
+        # uncertainty is confined to which value wins when both are present; any
+        # value it yields that is not a real client path now falls through to an
+        # honest 404 rather than silently serving the dashboard.
+        raw_uri = self.headers.get("x-forwarded-uri") or self.path
         parsed_url = urlparse(raw_uri)
         path = parsed_url.path.strip()
 
@@ -130,8 +140,13 @@ class handler(BaseHTTPRequestHandler):
         if len(path) > 1 and path.endswith("/"):
             path = path[:-1]
 
-        if path in ("", "/", "/index.html", "/api", "/api/index.py"):
-            html_content = render_dashboard_html()
+        # Note: `/api/index.py` is intentionally absent. It is the rewrite
+        # destination, not a client-facing route. Matching it here made every
+        # mis-routed request return 200 dashboard HTML instead of an error.
+        if path in ("", "/", "/index.html", "/api"):
+            # hosted=True bakes the serverless capability defaults into the HTML,
+            # so the UI stays gated even if /api/status never completes.
+            html_content = render_dashboard_html(hosted=True)
             body = html_content.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
