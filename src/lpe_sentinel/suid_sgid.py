@@ -13,7 +13,15 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-from lpe_sentinel.models import Finding
+try:
+    from lpe_sentinel.models import Finding
+    from lpe_sentinel.binary_risk import assess_binary_risk
+except ImportError:
+    from models import Finding
+    try:
+        from binary_risk import assess_binary_risk
+    except ImportError:
+        assess_binary_risk = None
 
 # MITRE ATT&CK reference for abuse of elevation control mechanism
 MITRE_ATTACK_ID = "T1548.001"
@@ -147,5 +155,9 @@ def scan_suid_sgid(search_paths: Iterable[Any]) -> List[Finding]:
 
                 if is_suid or is_sgid:
                     findings.append(_build_finding(file_path, mode, is_suid, is_sgid))
+                    if assess_binary_risk is not None:
+                        risk_finding = assess_binary_risk(file_path, mode, is_suid, is_sgid)
+                        if risk_finding is not None:
+                            findings.append(risk_finding)
 
     return findings
