@@ -1,0 +1,2 @@
+# LPE-Sentinel uses only the Python standard library.
+# No external third-party dependencies are required.
