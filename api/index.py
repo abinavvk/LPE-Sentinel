@@ -1,12 +1,21 @@
 """
-Vercel Python function entry point: hosted dashboard (native route `/api`).
+Vercel Python function entry point for LPE-Sentinel's hosted deployment.
 
-Selection is performed by Vercel's documented file-based function mapping, so
-this handler never needs to recover the client's original URL. `/` and
-`/index.html` reach the dashboard through the two narrow rewrites declared in
-vercel.json, which resolve to this route.
+Verified against a live preview deployment: Vercel detects `framework: python`
+and builds a single Python Lambda, so additional `api/*.py` files do not become
+separately deployed routes. This module is therefore the one entry point, and it
+dispatches on the original client request path, which the runtime does supply
+intact (for example `/api/status`).
 
-Read-only. Serves no live audit, no shell execution, and no SQLite access.
+Routes served:
+    /, /index.html, /api      -> hosted dashboard HTML
+    /api/status               -> hosted deployment status JSON
+    /api/demo-audit           -> simulated demo audit JSON (clearly labelled)
+    /api/history              -> intentional JSON 404 (hosted history unavailable)
+    anything else             -> JSON 404
+    POST/PUT/PATCH/DELETE     -> 405
+
+Read-only. Serves no live host audit, no shell execution, and no SQLite access.
 """
 
 import sys
@@ -18,7 +27,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 try:
-    from lpe_sentinel.web.hosted import DASHBOARD_PATHS, HostedHandlerBase
+    from lpe_sentinel.web.hosted import HostedHandlerBase
 except ImportError as err:
     raise RuntimeError(
         f"LPE-Sentinel Vercel deployment error: Failed to import package components from {SRC_DIR}. "
@@ -27,11 +36,7 @@ except ImportError as err:
 
 
 class handler(HostedHandlerBase):
-    """Serves the hosted dashboard for the `/api` route."""
+    """Single hosted entry point; routing is defined by HostedHandlerBase.dispatch()."""
 
     def _route(self, is_head: bool = False) -> None:
-        path = self.normalized_path()
-        if path in DASHBOARD_PATHS:
-            self.send_dashboard(is_head=is_head)
-        else:
-            self.send_not_found(path, is_head=is_head)
+        self.dispatch(is_head=is_head)

@@ -1,28 +1,26 @@
 """
-Tests for LPE-Sentinel Vercel Serverless Integration (native function routing).
+Tests for LPE-Sentinel Vercel Serverless Integration (single entry point).
 
 Routing model under test
 ------------------------
-Vercel exposes the resolved rewrite destination to a function as its request
-path. A single catch-all destination therefore cannot distinguish routes, so
-this deployment uses Vercel's documented file-based function mapping instead:
+Verified against a live Vercel preview deployment: the project is detected as
+`framework: python`, Vercel builds a single Python Lambda, and additional
+`api/*.py` files do not become separately deployed routes. All requests reach
+one entry point carrying the ORIGINAL client request path.
 
-    api/index.py      -> /api              (dashboard)
-    api/status.py     -> /api/status       (status JSON)
-    api/demo-audit.py -> /api/demo-audit   (simulated demo JSON)
-    api/history.py    -> /api/history      (intentional JSON 404)
+Therefore routing is performed by dispatching on the observed request path.
 
 Verifies:
-1. vercel.json routing declares no catch-all.
-2. Each native function serves exactly its own endpoint.
-3. The dashboard arrives with fail-closed hosted capabilities baked in.
+1. vercel.json declares no catch-all rewrite.
+2. Exactly one api/ entry point exists.
+3. Every documented route returns the correct status, content type, and body.
 4. Security headers are present on every hosted response.
 5. Every mutation verb is rejected with 405.
-6. No handler depends on recovering the original URL after a rewrite.
-7. Hosted code exposes no scanning, shell, or persistence surface.
+6. Demo findings are explicitly labelled as simulated.
+7. No handler depends on reconstructing the URL from a rewrite destination.
+8. Hosted code exposes no scanning, shell, or persistence surface.
 """
 
-import importlib.util
 import io
 import json
 import os
@@ -34,7 +32,7 @@ import tempfile
 import unittest
 from http import HTTPStatus
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # Ensure src and api are importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -45,26 +43,15 @@ for d in (SRC_DIR, API_DIR, PROJECT_ROOT):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
-from lpe_sentinel.web.hosted import get_hosted_status_payload
+from api.index import handler
+from lpe_sentinel.web.hosted import (
+    DEMO_AUDIT_PATH,
+    HISTORY_PATH,
+    HISTORY_UNAVAILABLE_REASON,
+    STATUS_PATH,
+    get_hosted_status_payload,
+)
 from lpe_sentinel.web.templates import render_dashboard_html
-
-# Native route -> api function file, per Vercel's documented file-based mapping.
-API_FUNCTIONS = {
-    "/api": "index.py",
-    "/api/status": "status.py",
-    "/api/demo-audit": "demo-audit.py",
-    "/api/history": "history.py",
-}
-
-
-def _load_api_module(filename: str):
-    """Import an api/*.py entry point by path (api/ is not a package)."""
-    module_name = "api_entry_" + re.sub(r"\W", "_", filename)
-    spec = importlib.util.spec_from_file_location(module_name, API_DIR / filename)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 class DummyWfile(io.BytesIO):
@@ -72,20 +59,14 @@ class DummyWfile(io.BytesIO):
     pass
 
 
-class TestVercelNativeRouting(unittest.TestCase):
+class TestVercelHostedRouting(unittest.TestCase):
     """Routing, response shape, and hosted safety properties."""
-
-    @classmethod
-    def setUpClass(cls) -> None:
-        # Keyed by entry-point filename, which is how tests address the modules.
-        cls.modules = {name: _load_api_module(name) for name in API_FUNCTIONS.values()}
 
     # -- helpers --------------------------------------------------------
 
-    def _invoke(self, filename: str, method: str, path: str, headers: dict | None = None):
-        """Invoke a hosted handler in memory and capture its response."""
-        module = self.modules[filename]
-        inst = module.handler.__new__(module.handler)
+    def _invoke(self, method: str, path: str, headers: dict | None = None):
+        """Invoke the hosted handler in memory and capture its response."""
+        inst = handler.__new__(handler)
         inst.command = method
         inst.path = path
         inst.headers = dict(headers) if headers else {}
@@ -96,98 +77,79 @@ class TestVercelNativeRouting(unittest.TestCase):
         response_code = [200]
         headers_sent = {}
 
-        def fake_send_response(code, message=None):
-            response_code[0] = int(code)
-
-        def fake_send_header(key, value):
-            headers_sent[key.lower()] = value
-
-        def fake_end_headers():
-            pass
-
-        inst.send_response = fake_send_response
-        inst.send_header = fake_send_header
-        inst.end_headers = fake_end_headers
+        inst.send_response = lambda code, message=None: response_code.__setitem__(0, int(code))
+        inst.send_header = lambda key, value: headers_sent.__setitem__(key.lower(), value)
+        inst.end_headers = lambda: None
 
         getattr(inst, "do_" + method)()
         return response_code[0], headers_sent, inst.wfile.getvalue()
 
-    @staticmethod
-    def _assert_security_headers(testcase: unittest.TestCase, headers: dict) -> None:
-        testcase.assertEqual(headers.get("x-content-type-options"), "nosniff")
-        testcase.assertEqual(headers.get("x-frame-options"), "DENY")
-        testcase.assertIn("default-src 'self'", headers.get("content-security-policy", ""))
-        testcase.assertIn("no-store", headers.get("cache-control", ""))
+    def _assert_security_headers(self, headers: dict) -> None:
+        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
+        self.assertEqual(headers.get("x-frame-options"), "DENY")
+        self.assertIn("default-src 'self'", headers.get("content-security-policy", ""))
+        self.assertIn("no-store", headers.get("cache-control", ""))
 
     # -- configuration --------------------------------------------------
 
     def test_vercel_json_has_no_catch_all_rewrite(self) -> None:
-        """The catch-all rewrite is the root cause of the hosted routing bug."""
+        """A catch-all collapses every request onto one indistinguishable path."""
         config = json.loads((PROJECT_ROOT / "vercel.json").read_text(encoding="utf-8"))
 
         self.assertEqual(config.get("version"), 2)
         rewrites = config.get("rewrites", [])
-        self.assertTrue(rewrites, "expected rewrites for / and /index.html")
-
         sources = [r.get("source") for r in rewrites]
-        destinations = [r.get("destination") for r in rewrites]
+        destinations = [str(r.get("destination")) for r in rewrites]
 
-        # No catch-all: it would funnel every request to one indistinguishable path.
         self.assertNotIn("/(.*)", sources)
         for dest in destinations:
-            self.assertNotIn("index.py", str(dest), "destinations must use native route paths")
+            self.assertNotIn("index.py", dest, "destinations must use route paths")
 
-        # Only the dashboard aliases are rewritten, and only to the dashboard route.
+        # Only the dashboard aliases are rewritten.
         self.assertEqual(sorted(sources), sorted(["/", "/index.html"]))
         self.assertEqual(destinations, ["/api", "/api"])
 
-    def test_every_native_function_file_exists(self) -> None:
-        """Each documented route has its own entry point."""
-        for route, filename in API_FUNCTIONS.items():
-            with self.subTest(route=route):
-                path = API_DIR / filename
-                self.assertTrue(path.exists(), f"missing entry point for {route}")
-                self.assertIn("class handler", path.read_text(encoding="utf-8"))
+    def test_single_api_entry_point(self) -> None:
+        """Only one api/*.py may exist: extra files do not become separate routes."""
+        entry_points = sorted(p.name for p in API_DIR.glob("*.py"))
+        self.assertEqual(entry_points, ["index.py"])
 
     # -- dashboard ------------------------------------------------------
 
-    def test_dashboard_route_serves_hosted_html(self) -> None:
-        for path in ("/api", "/", "/index.html"):
+    def test_dashboard_routes_serve_hosted_html(self) -> None:
+        for path in ("/", "/index.html", "/api"):
             with self.subTest(path=path):
-                code, headers, body = self._invoke("index.py", "GET", path)
+                code, headers, body = self._invoke("GET", path)
                 self.assertEqual(code, HTTPStatus.OK)
                 self.assertIn("text/html", headers.get("content-type", ""))
                 decoded = body.decode("utf-8")
                 self.assertIn("<!DOCTYPE html>", decoded)
                 self.assertIn("LPE-Sentinel", decoded)
-                self._assert_security_headers(self, headers)
+                self._assert_security_headers(headers)
 
-    def test_dashboard_route_rejects_other_paths(self) -> None:
-        """The dashboard function must not answer other endpoints."""
-        for path in ("/api/status", "/api/demo-audit", "/api/index.py", "/api/../etc"):
+    def test_dashboard_html_embeds_fail_closed_hosted_capabilities(self) -> None:
+        _, _, body = self._invoke("GET", "/api")
+        match = re.search(r"let hostedCapabilities = (.+?);", body.decode("utf-8"))
+        self.assertIsNotNone(match)
+        caps = json.loads(match.group(1))
+        self.assertIs(caps["isHosted"], True)
+        self.assertIs(caps["liveAudit"], False)
+        self.assertIs(caps["cloudHistory"], False)
+
+    def test_dashboard_trailing_slash_is_normalized(self) -> None:
+        for path in ("/api/", "/index.html/"):
             with self.subTest(path=path):
-                code, headers, body = self._invoke("index.py", "GET", path)
-                self.assertEqual(code, HTTPStatus.NOT_FOUND)
-                self.assertIn("application/json", headers.get("content-type", ""))
-                self.assertEqual(json.loads(body.decode("utf-8"))["status"], "NOT_FOUND")
-
-    def test_rewrite_destination_is_not_dashboard(self) -> None:
-        """Regression: /api/index.py must never serve the dashboard.
-
-        This path is what a catch-all rewrite produced, and serving HTML for it
-        silently broke every JSON endpoint on the hosted deployment.
-        """
-        code, headers, body = self._invoke("index.py", "GET", "/api/index.py")
-        self.assertEqual(code, HTTPStatus.NOT_FOUND)
-        self.assertNotIn("<!DOCTYPE html>", body.decode("utf-8"))
+                code, headers, _ = self._invoke("GET", path)
+                self.assertEqual(code, HTTPStatus.OK)
+                self.assertIn("text/html", headers.get("content-type", ""))
 
     # -- status ---------------------------------------------------------
 
     def test_status_route_serves_cloud_portal_json(self) -> None:
-        code, headers, body = self._invoke("status.py", "GET", "/api/status")
+        code, headers, body = self._invoke("GET", STATUS_PATH)
         self.assertEqual(code, HTTPStatus.OK)
         self.assertIn("application/json", headers.get("content-type", ""))
-        self._assert_security_headers(self, headers)
+        self._assert_security_headers(headers)
 
         data = json.loads(body.decode("utf-8"))
         self.assertEqual(data["status"], "ACTIVE")
@@ -195,19 +157,11 @@ class TestVercelNativeRouting(unittest.TestCase):
         self.assertTrue(data["deployment"]["is_hosted"])
         self.assertIn("notice", data)
 
-    def test_status_route_does_not_depend_on_request_path(self) -> None:
-        """The function serves its own route regardless of the observed path.
-
-        Proves routing is performed by native function selection, not by
-        inspecting a path that a rewrite may have rewritten.
-        """
-        for path in ("/api/status", "/api", "/", "/api/demo-audit"):
-            with self.subTest(path=path):
-                code, _, body = self._invoke("status.py", "GET", path)
-                self.assertEqual(code, HTTPStatus.OK)
-                self.assertEqual(
-                    json.loads(body.decode("utf-8"))["service"], "LPE-Sentinel Cloud Portal"
-                )
+    def test_status_route_ignores_query_string(self) -> None:
+        """Query parameters must not break path-based routing."""
+        code, _, body = self._invoke("GET", STATUS_PATH + "?x=1")
+        self.assertEqual(code, HTTPStatus.OK)
+        self.assertEqual(json.loads(body.decode("utf-8"))["service"], "LPE-Sentinel Cloud Portal")
 
     def test_status_payload_omits_secrets_and_paths(self) -> None:
         with patch.dict(os.environ, {"VERCEL_REGION": "sfo1", "SECRET_KEY": "supersecret"}):
@@ -227,10 +181,10 @@ class TestVercelNativeRouting(unittest.TestCase):
     # -- demo audit -----------------------------------------------------
 
     def test_demo_audit_route_serves_watermarked_simulated_findings(self) -> None:
-        code, headers, body = self._invoke("demo-audit.py", "GET", "/api/demo-audit")
+        code, headers, body = self._invoke("GET", DEMO_AUDIT_PATH)
         self.assertEqual(code, HTTPStatus.OK)
         self.assertIn("application/json", headers.get("content-type", ""))
-        self._assert_security_headers(self, headers)
+        self._assert_security_headers(headers)
 
         data = json.loads(body.decode("utf-8"))
         self.assertTrue(data["is_demo"])
@@ -245,8 +199,32 @@ class TestVercelNativeRouting(unittest.TestCase):
             self.assertIn("[SIMULATED DEMO]", finding.get("title", ""))
             self.assertNotIn("Users", finding.get("affected_resource", ""))
 
+    def test_demo_audit_does_not_claim_to_scan_the_visitor(self) -> None:
+        """Hosted demo must not imply it scanned the visitor's machine."""
+        _, _, body = self._invoke("GET", DEMO_AUDIT_PATH)
+        data = json.loads(body.decode("utf-8"))
+        blob = json.dumps(data).lower()
+
+        # The disclaimer must state the data is synthetic and not a live scan.
+        self.assertIn("synthetic", data["disclaimer"].lower())
+        self.assertIn("do not", data["disclaimer"].lower())
+
+        # No claim about scanning the visitor's own machine.
+        for phrase in ("your computer", "your machine", "your host", "your system", "scanned your"):
+            self.assertNotIn(phrase, blob, f"demo payload must not mention '{phrase}'")
+
+        # Any platform reference (e.g. a simulated kernel release string) must
+        # be explicitly qualified as simulated or demo, never presented as a
+        # real host that was scanned.
+        for match in re.finditer(r"kali|linux|windows", blob):
+            window = blob[max(0, match.start() - 48): match.end() + 48]
+            self.assertTrue(
+                "simulat" in window or "demo" in window,
+                f"unqualified platform claim near: {window!r}",
+            )
+
     def test_demo_audit_head_returns_headers_without_body(self) -> None:
-        code, headers, body = self._invoke("demo-audit.py", "HEAD", "/api/demo-audit")
+        code, headers, body = self._invoke("HEAD", DEMO_AUDIT_PATH)
         self.assertEqual(code, HTTPStatus.OK)
         self.assertIn("application/json", headers.get("content-type", ""))
         self.assertEqual(body, b"")
@@ -254,20 +232,44 @@ class TestVercelNativeRouting(unittest.TestCase):
     # -- history and unknown routes -------------------------------------
 
     def test_history_route_returns_intentional_json_404(self) -> None:
-        code, headers, body = self._invoke("history.py", "GET", "/api/history")
+        code, headers, body = self._invoke("GET", HISTORY_PATH)
         self.assertEqual(code, HTTPStatus.NOT_FOUND)
         self.assertIn("application/json", headers.get("content-type", ""))
-        self._assert_security_headers(self, headers)
-        self.assertEqual(json.loads(body.decode("utf-8"))["status"], "NOT_FOUND")
+        self._assert_security_headers(headers)
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["status"], "NOT_FOUND")
+        self.assertEqual(data["error"], HISTORY_UNAVAILABLE_REASON)
+        self.assertIn("not implemented", data["error"])
+
+    def test_unknown_routes_return_consistent_json_404(self) -> None:
+        for path in ("/nope", "/api/unknown", "/api/status/extra", "/api/index.py", "/api/../etc"):
+            with self.subTest(path=path):
+                code, headers, body = self._invoke("GET", path)
+                self.assertEqual(code, HTTPStatus.NOT_FOUND)
+                self.assertIn("application/json", headers.get("content-type", ""))
+                self._assert_security_headers(headers)
+                self.assertEqual(json.loads(body.decode("utf-8"))["status"], "NOT_FOUND")
+
+    def test_rewrite_destination_path_is_not_dashboard(self) -> None:
+        """Regression: the old catch-all destination must not serve the dashboard.
+
+        Serving HTML here silently broke every JSON endpoint on the hosted
+        deployment, because each one received HTML where JSON was expected.
+        """
+        code, headers, body = self._invoke("GET", "/api/index.py")
+        self.assertEqual(code, HTTPStatus.NOT_FOUND)
+        self.assertNotIn("<!DOCTYPE html>", body.decode("utf-8"))
 
     # -- method rejection -----------------------------------------------
 
-    def test_every_hosted_route_rejects_mutations(self) -> None:
-        """No hosted endpoint may mutate state or trigger an audit."""
-        for route, filename in API_FUNCTIONS.items():
+    def test_every_route_rejects_mutations(self) -> None:
+        """No hosted route may mutate state or trigger an audit."""
+        routes = ("/", "/api", STATUS_PATH, DEMO_AUDIT_PATH, HISTORY_PATH, "/unknown")
+        for route in routes:
             for method in ("POST", "PUT", "PATCH", "DELETE"):
                 with self.subTest(route=route, method=method):
-                    code, headers, body = self._invoke(filename, method, route)
+                    code, headers, body = self._invoke(method, route)
                     self.assertEqual(code, HTTPStatus.METHOD_NOT_ALLOWED)
                     self.assertIn("application/json", headers.get("content-type", ""))
                     self.assertEqual(
@@ -277,17 +279,15 @@ class TestVercelNativeRouting(unittest.TestCase):
     # -- no original-path recovery --------------------------------------
 
     def test_no_handler_recovers_original_url_from_rewrite(self) -> None:
-        """Guards the root cause: nothing may depend on reconstructing the URL.
+        """Guards the original root cause.
 
-        Vercel supplies the resolved rewrite destination as the request path and
-        sends neither of these headers, so relying on them silently breaks all
-        routing.
+        Routing now legitimately reads the request path, but it must never try to
+        reconstruct the URL from headers or rewrite destinations.
         """
         sources = {p.name: p.read_text(encoding="utf-8") for p in API_DIR.glob("*.py")}
         sources["hosted.py"] = (SRC_DIR / "lpe_sentinel" / "web" / "hosted.py").read_text(
             encoding="utf-8"
         )
-
         for name, text in sources.items():
             with self.subTest(module=name):
                 self.assertNotIn("x-forwarded-uri", text)

@@ -8,22 +8,16 @@ only. Local CLI, scanner, and SQLite history behavior are unaffected.
 
 Routing model
 -------------
-Vercel exposes the *resolved rewrite destination* to the function as the request
-path (CLI release notes, vercel@58.9.3: "Expose the resolved rewrite destination
-as the request path observed by Python framework applications"). A single
-catch-all destination therefore cannot distinguish between routes, because every
-request arrives carrying the same path value.
+Verified against a live Vercel preview deployment: this project is detected as
+`framework: python` and Vercel builds a single Python Lambda, so `api/*.py`
+files do NOT become independently deployed routes. All requests reach one
+entry point, and the handler receives the ORIGINAL client request path
+(e.g. `/api/status`), not a rewrite destination.
 
-This deployment consequently uses Vercel's documented file-based function
-mapping, where each endpoint is its own function and no rewrite rewrites it:
-
-    api/index.py      -> /api              (dashboard)
-    api/status.py     -> /api/status       (status JSON)
-    api/demo-audit.py -> /api/demo-audit   (simulated demo JSON)
-    api/history.py    -> /api/history      (intentional JSON 404)
-
-Because each endpoint is selected by native route matching, no handler needs to
-recover the client's original URL from a rewrite destination.
+Routing is therefore performed by dispatching on the observed request path.
+This is safe precisely because the path is the genuine client path; a
+catch-all rewrite that collapses every request onto one destination would
+destroy that signal, so `vercel.json` only rewrites the dashboard aliases.
 """
 
 import json
@@ -37,10 +31,20 @@ from lpe_sentinel import __version__
 from lpe_sentinel.web.demo_data import get_demo_audit_payload
 from lpe_sentinel.web.templates import render_dashboard_html
 
-# Routes that serve the hosted dashboard when handled by the /api function.
-# Both the native path and the rewrite destination are accepted so the
-# dashboard renders regardless of which value the platform supplies.
-DASHBOARD_PATHS = ("", "/", "/index.html", "/api")
+# Routes that serve the hosted dashboard.
+DASHBOARD_PATHS = frozenset(("", "/", "/index.html", "/api"))
+
+STATUS_PATH = "/api/status"
+DEMO_AUDIT_PATH = "/api/demo-audit"
+HISTORY_PATH = "/api/history"
+
+# Cloud audit history needs persistent storage a serverless function does not have.
+HISTORY_UNAVAILABLE_REASON = (
+    "Cloud audit history is not implemented in the hosted deployment. "
+    "Audit history requires persistent local storage, which a serverless function "
+    "does not have. Run the CLI or the local dashboard on your target Linux host "
+    "to record history."
+)
 
 
 def get_hosted_status_payload() -> dict:
@@ -158,12 +162,12 @@ class HostedHandlerBase(BaseHTTPRequestHandler):
         """Serve simulated demo findings, explicitly watermarked as simulated."""
         self._send_json_response(get_demo_audit_payload(), status=HTTPStatus.OK, is_head=is_head)
 
-    def send_not_found(self, path: str, is_head: bool = False) -> None:
+    def send_not_found(self, path: str, is_head: bool = False, reason: str | None = None) -> None:
         """Serve an intentional JSON 404 for unsupported hosted routes."""
         self._send_json_response(
             {
                 "status": "NOT_FOUND",
-                "error": f"Endpoint '{path}' not available on the Vercel deployment",
+                "error": reason or f"Endpoint '{path}' not available on the Vercel deployment",
             },
             status=HTTPStatus.NOT_FOUND,
             is_head=is_head,
@@ -178,6 +182,29 @@ class HostedHandlerBase(BaseHTTPRequestHandler):
             },
             status=HTTPStatus.METHOD_NOT_ALLOWED,
         )
+
+    # -- routing --------------------------------------------------------
+
+    def dispatch(self, is_head: bool = False) -> None:
+        """Route a safe request using the observed (original client) path.
+
+        Single source of truth for hosted routing. The hosted deployment is
+        read-only: it serves the dashboard, deployment status, and simulated
+        demo findings only. No route can trigger a live host audit, shell
+        execution, SQLite access, or remediation.
+        """
+        path = self.normalized_path()
+
+        if path in DASHBOARD_PATHS:
+            self.send_dashboard(is_head=is_head)
+        elif path == STATUS_PATH:
+            self.send_status(is_head=is_head)
+        elif path == DEMO_AUDIT_PATH:
+            self.send_demo_audit(is_head=is_head)
+        elif path == HISTORY_PATH:
+            self.send_not_found(path, is_head=is_head, reason=HISTORY_UNAVAILABLE_REASON)
+        else:
+            self.send_not_found(path, is_head=is_head)
 
     # -- verb handling ---------------------------------------------------
 
