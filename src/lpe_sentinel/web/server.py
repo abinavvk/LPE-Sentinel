@@ -32,6 +32,7 @@ try:
         generate_json_export,
     )
     from lpe_sentinel.audit_diff import AuditComparisonError, compare_history_audits
+    from lpe_sentinel.report_validation import validate_report_data
     from lpe_sentinel.suid_sgid import is_linux_platform
     from lpe_sentinel.system_info import collect_system_info
     from lpe_sentinel.web.demo_data import get_demo_audit_payload
@@ -40,6 +41,7 @@ except ImportError:
     from __version__ import __version__
     from audit_diff import AuditComparisonError, compare_history_audits
     from audit_engine import ALL_SCANNER_NAMES, AuditResult, run_unified_audit
+    from report_validation import validate_report_data
     from audit_history import (
         DEFAULT_LIST_LIMIT,
         MAX_LIST_LIMIT,
@@ -59,6 +61,86 @@ except ImportError:
 
 # Maximum allowable request body size (64 KB) to protect against buffer exhaustion
 MAX_REQUEST_BODY_BYTES = 65536
+
+# Fields copied from an imported report's system_info block. Anything not listed
+# here is dropped rather than echoed, so a crafted report cannot inject arbitrary
+# keys into the API response.
+IMPORT_SYSTEM_INFO_FIELDS = (
+    "os_name",
+    "os_release",
+    "hostname",
+    "username",
+    "architecture",
+    "platform_category",
+)
+
+# Fields copied from an imported report's summary block.
+IMPORT_SUMMARY_FIELDS = ("total_findings", "severity_counts")
+
+# Fields copied from each imported finding. Anything else is discarded.
+IMPORT_FINDING_FIELDS = (
+    "finding_id",
+    "title",
+    "severity",
+    "description",
+    "evidence",
+    "affected_resource",
+    "recommendation",
+    "mitre_attack",
+)
+
+
+def _build_import_response(report_data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build the /api/import-report response from an explicit allow-list.
+
+    Every value is copied field-by-field from approved keys. Unknown keys in the
+    supplied report are never echoed back. Provenance (host, OS, timestamp) is
+    taken from the report itself so imported results keep their true origin and
+    are never presented as a live scan of the machine serving the dashboard.
+    """
+    metadata = report_data.get("report_metadata") or {}
+    system_info = report_data.get("system_info") or {}
+    summary = report_data.get("summary") or {}
+    findings = report_data.get("findings") or []
+
+    safe_system_info = {
+        key: system_info[key] for key in IMPORT_SYSTEM_INFO_FIELDS if key in system_info
+    }
+    safe_summary = {
+        key: summary[key] for key in IMPORT_SUMMARY_FIELDS if key in summary
+    }
+    safe_findings = [
+        {key: finding[key] for key in IMPORT_FINDING_FIELDS if key in finding}
+        for finding in findings
+        if isinstance(finding, dict)
+    ]
+
+    return {
+        "status": "IMPORTED",
+        "source": "local_report",
+        # An imported report is a completed historical run from another host.
+        # It is never a live scan and never simulated demo data.
+        "is_live_scan": False,
+        "is_demo": False,
+        "is_simulated": False,
+        # No signature exists in the report format, so authenticity is unproven.
+        "verification_status": "unverified",
+        "notice": (
+            "Imported audit report. These results were generated earlier by the LPE-Sentinel CLI "
+            "on the host shown below. They were NOT produced by scanning this machine, and the "
+            "dashboard cannot verify the file's authenticity."
+        ),
+        "report_metadata": {
+            "project_name": metadata.get("project_name"),
+            "version": metadata.get("version"),
+            "format_version": metadata.get("format_version"),
+            "generated_at": metadata.get("generated_at"),
+        },
+        "system_info": safe_system_info,
+        "summary": safe_summary,
+        "findings": safe_findings,
+    }
 
 
 class LpeSentinelWebHandler(BaseHTTPRequestHandler):
@@ -427,6 +509,97 @@ class LpeSentinelWebHandler(BaseHTTPRequestHandler):
                         audit_idle_event.set()
                     audit_lock.release()
 
+    def _handle_api_import_report(self, body_bytes: bytes) -> None:
+        """
+        Validate and return a previously generated audit report (POST /api/import-report).
+
+        Accepts a report ONLY as an already-parsed request body. No filesystem
+        path, filename, or uploaded file is ever accepted, read, or executed.
+        The report is re-validated in full with validate_report_data() and the
+        response is constructed field-by-field from an explicit allow-list, so
+        unknown or attacker-supplied keys can never be echoed back.
+
+        Imported results are always marked as a historical local report:
+        they are not a live scan, and their provenance is the original report's
+        own host and timestamp, never this server's identity.
+        """
+        # 1. Content-Type validation
+        content_type = self.headers.get("Content-Type", "")
+        if "application/json" not in content_type.lower():
+            self._send_json_response(
+                {"error": "Content-Type must be application/json", "status": "BAD_REQUEST"},
+                status=HTTPStatus.UNSUPPORTED_MEDIA_TYPE,
+            )
+            return
+
+        # 2. Origin & Referer validation
+        if not self._validate_origin():
+            self._send_json_response(
+                {"error": "Forbidden: Cross-origin request blocked", "status": "FORBIDDEN"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        # 3. Parse JSON body
+        if not body_bytes.strip():
+            self._send_json_response(
+                {"error": "Request body is empty; expected an audit report", "status": "BAD_REQUEST"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        try:
+            report_data = json.loads(body_bytes.decode("utf-8"))
+        except Exception:
+            self._send_json_response(
+                {"error": "Malformed JSON in request body", "status": "BAD_REQUEST"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if not isinstance(report_data, dict):
+            self._send_json_response(
+                {"error": "Report data must be a JSON object", "status": "BAD_REQUEST"},
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        # 4. CSRF token validation (after structural checks, before any use)
+        if not self._validate_csrf_token():
+            self._send_json_response(
+                {"error": "Forbidden: Invalid or missing CSRF token", "status": "FORBIDDEN"},
+                status=HTTPStatus.FORBIDDEN,
+            )
+            return
+
+        # 5. Full schema/content validation of the entire report
+        try:
+            validation = validate_report_data(report_data)
+        except Exception:
+            self._send_json_response(
+                {"error": "Internal error while validating the report", "status": "ERROR"},
+                status=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+            return
+
+        if not validation.is_valid:
+            self._send_json_response(
+                {
+                    "status": "INVALID_REPORT",
+                    "error": "The supplied file is not a valid LPE-Sentinel audit report",
+                    "validation_errors": list(validation.errors),
+                },
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        # 6. Build the response from an explicit allow-list of fields only.
+        #    Unknown keys present in the uploaded report are deliberately dropped.
+        self._send_json_response(
+            _build_import_response(report_data),
+            status=HTTPStatus.OK,
+        )
+
     def do_POST(self) -> None:
         """Handle incoming POST requests with robust body and connection management."""
         is_valid, body, error_msg, err_status = self._parse_and_drain_request_body()
@@ -441,6 +614,8 @@ class LpeSentinelWebHandler(BaseHTTPRequestHandler):
 
         if path == "/api/run-audit":
             self._handle_api_run_audit(body or b"")
+        elif path == "/api/import-report":
+            self._handle_api_import_report(body or b"")
         elif path == "/api/history" or path.startswith("/api/history/"):
             self._send_json_response(
                 {"error": "Method Not Allowed: history endpoints are read-only", "path": path},
