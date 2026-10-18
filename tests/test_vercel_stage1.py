@@ -1,12 +1,24 @@
 """
-Tests for LPE-Sentinel Vercel Serverless Integration (Stage 1).
+Tests for LPE-Sentinel Vercel Serverless Integration (single entry point).
+
+Routing model under test
+------------------------
+Verified against a live Vercel preview deployment: the project is detected as
+`framework: python`, Vercel builds a single Python Lambda, and additional
+`api/*.py` files do not become separately deployed routes. All requests reach
+one entry point carrying the ORIGINAL client request path.
+
+Therefore routing is performed by dispatching on the observed request path.
 
 Verifies:
-1. vercel.json configuration validity and routing.
-2. api/index.py status payload identifying the environment as hosted serverless.
-3. Dashboard rendering through the serverless entry point.
-4. Security headers on all serverless responses.
-5. Rejection of unhandled routes and mutation methods.
+1. vercel.json declares no catch-all rewrite.
+2. Exactly one api/ entry point exists.
+3. Every documented route returns the correct status, content type, and body.
+4. Security headers are present on every hosted response.
+5. Every mutation verb is rejected with 405.
+6. Demo findings are explicitly labelled as simulated.
+7. No handler depends on reconstructing the URL from a rewrite destination.
+8. Hosted code exposes no scanning, shell, or persistence surface.
 """
 
 import io
@@ -20,7 +32,7 @@ import tempfile
 import unittest
 from http import HTTPStatus
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 # Ensure src and api are importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -31,7 +43,14 @@ for d in (SRC_DIR, API_DIR, PROJECT_ROOT):
     if str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
-from api.index import get_hosted_status_payload, handler
+from api.index import handler
+from lpe_sentinel.web.hosted import (
+    DEMO_AUDIT_PATH,
+    HISTORY_PATH,
+    HISTORY_UNAVAILABLE_REASON,
+    STATUS_PATH,
+    get_hosted_status_payload,
+)
 from lpe_sentinel.web.templates import render_dashboard_html
 
 
@@ -40,282 +59,270 @@ class DummyWfile(io.BytesIO):
     pass
 
 
-class TestVercelIntegrationStage1(unittest.TestCase):
-    """Test suite for Vercel serverless entry point and configuration."""
+class TestVercelHostedRouting(unittest.TestCase):
+    """Routing, response shape, and hosted safety properties."""
 
-    def test_vercel_json_configuration(self) -> None:
-        """Verify vercel.json exists, is valid JSON, and routes traffic to api/index.py."""
-        vercel_config_path = PROJECT_ROOT / "vercel.json"
-        self.assertTrue(vercel_config_path.exists(), "vercel.json must exist")
-        with open(vercel_config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
+    # -- helpers --------------------------------------------------------
 
-        self.assertEqual(config.get("version"), 2)
-        rewrites = config.get("rewrites", [])
-        self.assertTrue(any(r.get("destination") == "/api/index.py" for r in rewrites))
-
-    def test_hosted_status_payload_structure_and_safety(self) -> None:
-        """Verify status payload identifies as hosted and omits secrets or raw host paths."""
-        with patch.dict(os.environ, {"VERCEL_REGION": "sfo1", "SECRET_KEY": "supersecret"}):
-            status = get_hosted_status_payload()
-
-        self.assertEqual(status["status"], "ACTIVE")
-        self.assertEqual(status["service"], "LPE-Sentinel Cloud Portal")
-        self.assertTrue(status["deployment"]["is_hosted"])
-        self.assertEqual(status["deployment"]["platform"], "vercel")
-        self.assertEqual(status["deployment"]["region"], "sfo1")
-        self.assertFalse(status["capabilities"]["live_audit"])
-        self.assertIn("notice", status)
-
-        # Confirm no internal environment secrets or user paths are leaked
-        serialized = json.dumps(status)
-        self.assertNotIn("supersecret", serialized)
-        self.assertNotIn("Users", serialized)
-
-    def _invoke_handler(self, method: str, path: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
-        """Helper to invoke the Vercel BaseHTTPRequestHandler in memory."""
-        mock_request = MagicMock()
-        mock_client_address = ("127.0.0.1", 12345)
-        mock_server = MagicMock()
-
+    def _invoke(self, method: str, path: str, headers: dict | None = None):
+        """Invoke the hosted handler in memory and capture its response."""
         inst = handler.__new__(handler)
-        inst.request = mock_request
-        inst.client_address = mock_client_address
-        inst.server = mock_server
         inst.command = method
         inst.path = path
-        inst.request_version = "HTTP/1.1"
         inst.headers = dict(headers) if headers else {}
         inst.rfile = io.BytesIO()
         inst.wfile = io.BytesIO()
         inst.close_connection = False
 
-        headers_sent = {}
         response_code = [200]
+        headers_sent = {}
 
-        def fake_send_response(code, message=None):
-            response_code[0] = int(code)
+        inst.send_response = lambda code, message=None: response_code.__setitem__(0, int(code))
+        inst.send_header = lambda key, value: headers_sent.__setitem__(key.lower(), value)
+        inst.end_headers = lambda: None
 
-        def fake_send_header(k, v):
-            headers_sent[k.lower()] = v
+        getattr(inst, "do_" + method)()
+        return response_code[0], headers_sent, inst.wfile.getvalue()
 
-        def fake_end_headers():
-            pass
-
-        inst.send_response = fake_send_response
-        inst.send_header = fake_send_header
-        inst.end_headers = fake_end_headers
-
-        if method == "GET":
-            inst.do_GET()
-        elif method == "HEAD":
-            inst.do_HEAD()
-        elif method == "POST":
-            inst.do_POST()
-
-        body = inst.wfile.getvalue()
-        return response_code[0], headers_sent, body
-
-    def test_serverless_api_status_endpoint(self) -> None:
-        """Verify GET /api/status returns 200, hosted metadata, and security headers."""
-        code, headers, body = self._invoke_handler("GET", "/api/status")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("application/json", headers.get("content-type", ""))
+    def _assert_security_headers(self, headers: dict) -> None:
         self.assertEqual(headers.get("x-content-type-options"), "nosniff")
         self.assertEqual(headers.get("x-frame-options"), "DENY")
         self.assertIn("default-src 'self'", headers.get("content-security-policy", ""))
+        self.assertIn("no-store", headers.get("cache-control", ""))
 
-        data = json.loads(body.decode("utf-8"))
-        self.assertEqual(data["status"], "ACTIVE")
-        self.assertTrue(data["deployment"]["is_hosted"])
+    # -- configuration --------------------------------------------------
 
-    def test_serverless_dashboard_endpoint(self) -> None:
-        """Verify GET / renders the full HTML dashboard with security headers."""
-        code, headers, body = self._invoke_handler("GET", "/")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("text/html", headers.get("content-type", ""))
-        self.assertIn("<!DOCTYPE html>", body.decode("utf-8"))
-        self.assertIn("LPE-Sentinel", body.decode("utf-8"))
+    def test_vercel_json_has_no_catch_all_rewrite(self) -> None:
+        """A catch-all collapses every request onto one indistinguishable path."""
+        config = json.loads((PROJECT_ROOT / "vercel.json").read_text(encoding="utf-8"))
 
-    def test_serverless_unhandled_route_returns_404(self) -> None:
-        """Verify unknown path returns 404 JSON."""
-        code, headers, body = self._invoke_handler("GET", "/api/nonexistent")
-        self.assertEqual(code, HTTPStatus.NOT_FOUND)
-        data = json.loads(body.decode("utf-8"))
-        self.assertEqual(data["status"], "NOT_FOUND")
+        self.assertEqual(config.get("version"), 2)
+        rewrites = config.get("rewrites", [])
+        sources = [r.get("source") for r in rewrites]
+        destinations = [str(r.get("destination")) for r in rewrites]
 
-    def test_serverless_demo_audit_endpoint(self) -> None:
-        """Verify GET /api/demo-audit returns 200, simulated demo findings, watermarks, and security headers."""
-        code, headers, body = self._invoke_handler("GET", "/api/demo-audit")
+        self.assertNotIn("/(.*)", sources)
+        for dest in destinations:
+            self.assertNotIn("index.py", dest, "destinations must use route paths")
+
+        # Only the dashboard aliases are rewritten.
+        self.assertEqual(sorted(sources), sorted(["/", "/index.html"]))
+        self.assertEqual(destinations, ["/api", "/api"])
+
+    def test_single_api_entry_point(self) -> None:
+        """Only one api/*.py may exist: extra files do not become separate routes."""
+        entry_points = sorted(p.name for p in API_DIR.glob("*.py"))
+        self.assertEqual(entry_points, ["index.py"])
+
+    # -- dashboard ------------------------------------------------------
+
+    def test_dashboard_routes_serve_hosted_html(self) -> None:
+        for path in ("/", "/index.html", "/api"):
+            with self.subTest(path=path):
+                code, headers, body = self._invoke("GET", path)
+                self.assertEqual(code, HTTPStatus.OK)
+                self.assertIn("text/html", headers.get("content-type", ""))
+                decoded = body.decode("utf-8")
+                self.assertIn("<!DOCTYPE html>", decoded)
+                self.assertIn("LPE-Sentinel", decoded)
+                self._assert_security_headers(headers)
+
+    def test_dashboard_html_embeds_fail_closed_hosted_capabilities(self) -> None:
+        _, _, body = self._invoke("GET", "/api")
+        match = re.search(r"let hostedCapabilities = (.+?);", body.decode("utf-8"))
+        self.assertIsNotNone(match)
+        caps = json.loads(match.group(1))
+        self.assertIs(caps["isHosted"], True)
+        self.assertIs(caps["liveAudit"], False)
+        self.assertIs(caps["cloudHistory"], False)
+
+    def test_dashboard_trailing_slash_is_normalized(self) -> None:
+        for path in ("/api/", "/index.html/"):
+            with self.subTest(path=path):
+                code, headers, _ = self._invoke("GET", path)
+                self.assertEqual(code, HTTPStatus.OK)
+                self.assertIn("text/html", headers.get("content-type", ""))
+
+    # -- status ---------------------------------------------------------
+
+    def test_status_route_serves_cloud_portal_json(self) -> None:
+        code, headers, body = self._invoke("GET", STATUS_PATH)
         self.assertEqual(code, HTTPStatus.OK)
         self.assertIn("application/json", headers.get("content-type", ""))
-        self.assertEqual(headers.get("x-content-type-options"), "nosniff")
-        self.assertEqual(headers.get("x-frame-options"), "DENY")
+        self._assert_security_headers(headers)
 
         data = json.loads(body.decode("utf-8"))
-        self.assertTrue(data.get("is_demo"))
-        self.assertTrue(data.get("is_simulated"))
-        self.assertIn("SIMULATED DEMO DATA", data.get("demo_watermark", ""))
-        self.assertIn("disclaimer", data)
-
-        findings = data.get("findings", [])
-        self.assertGreater(len(findings), 0)
-        # Every finding title must be explicitly marked as simulated
-        for f in findings:
-            self.assertTrue(f.get("is_simulated"))
-            self.assertIn("[SIMULATED DEMO]", f.get("title", ""))
-            # Ensure no local machine paths or secrets are leaked
-            self.assertNotIn("Users", f.get("affected_resource", ""))
-
-    def test_serverless_demo_audit_unsupported_methods(self) -> None:
-        """Verify non-GET requests to /api/demo-audit are rejected with 405 Method Not Allowed."""
-        code, headers, body = self._invoke_handler("POST", "/api/demo-audit")
-        self.assertEqual(code, HTTPStatus.METHOD_NOT_ALLOWED)
-        data = json.loads(body.decode("utf-8"))
-        self.assertEqual(data.get("status"), "METHOD_NOT_ALLOWED")
-
-    def test_serverless_demo_audit_head_request(self) -> None:
-        """Verify HEAD /api/demo-audit returns headers only without body."""
-        code, headers, body = self._invoke_handler("HEAD", "/api/demo-audit")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("application/json", headers.get("content-type", ""))
-    def test_vercel_forwarded_headers_resolution(self) -> None:
-        """Verify routing honors the x-forwarded-uri defensive override."""
-        # Simulated scenario: self.path is the rewrite destination, but the client requested /api/status
-        inst = handler.__new__(handler)
-        inst.command = "GET"
-        inst.path = "/api/index.py"
-        inst.headers = {"x-forwarded-uri": "/api/status"}
-        inst.rfile = io.BytesIO()
-        inst.wfile = io.BytesIO()
-        inst.close_connection = False
-
-        response_code = [200]
-        headers_sent = {}
-        inst.send_response = lambda code, msg=None: response_code.__setitem__(0, int(code))
-        inst.send_header = lambda k, v: headers_sent.__setitem__(k.lower(), v)
-        inst.end_headers = lambda: None
-
-        inst.do_GET()
-        self.assertEqual(response_code[0], HTTPStatus.OK)
-        data = json.loads(inst.wfile.getvalue().decode("utf-8"))
         self.assertEqual(data["status"], "ACTIVE")
         self.assertEqual(data["service"], "LPE-Sentinel Cloud Portal")
+        self.assertTrue(data["deployment"]["is_hosted"])
+        self.assertIn("notice", data)
 
-    # ------------------------------------------------------------------
-    # Regression tests: rewrite-destination routing + capability gating
-    # ------------------------------------------------------------------
+    def test_status_route_ignores_query_string(self) -> None:
+        """Query parameters must not break path-based routing."""
+        code, _, body = self._invoke("GET", STATUS_PATH + "?x=1")
+        self.assertEqual(code, HTTPStatus.OK)
+        self.assertEqual(json.loads(body.decode("utf-8"))["service"], "LPE-Sentinel Cloud Portal")
 
-    def test_rewrite_destination_without_headers_is_not_dashboard(self) -> None:
-        """Regression: /api/index.py with no forwarded headers must NOT serve dashboard HTML.
+    def test_status_payload_omits_secrets_and_paths(self) -> None:
+        with patch.dict(os.environ, {"VERCEL_REGION": "sfo1", "SECRET_KEY": "supersecret"}):
+            status = get_hosted_status_payload()
+        serialized = json.dumps(status)
+        self.assertNotIn("supersecret", serialized)
+        self.assertNotIn("Users", serialized)
+        self.assertEqual(status["deployment"]["region"], "sfo1")
 
-        The rewrite destination is not a client-facing route. Previously it was
-        matched by the dashboard branch, so every mis-routed request returned
-        200 text/html and the dashboard's res.json() calls raised a parse error.
-        """
-        code, headers, body = self._invoke_handler("GET", "/api/index.py")
+    def test_status_capabilities_declare_unsupported_features(self) -> None:
+        caps = get_hosted_status_payload()["capabilities"]
+        self.assertTrue(caps["demo_mode"])
+        self.assertFalse(caps["live_audit"])
+        self.assertFalse(caps["cloud_history"])
+        self.assertFalse(caps["report_ingestion"])
 
+    # -- demo audit -----------------------------------------------------
+
+    def test_demo_audit_route_serves_watermarked_simulated_findings(self) -> None:
+        code, headers, body = self._invoke("GET", DEMO_AUDIT_PATH)
+        self.assertEqual(code, HTTPStatus.OK)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        self._assert_security_headers(headers)
+
+        data = json.loads(body.decode("utf-8"))
+        self.assertTrue(data["is_demo"])
+        self.assertTrue(data["is_simulated"])
+        self.assertIn("SIMULATED DEMO DATA", data["demo_watermark"])
+        self.assertIn("disclaimer", data)
+
+        findings = data["findings"]
+        self.assertGreater(len(findings), 0)
+        for finding in findings:
+            self.assertTrue(finding.get("is_simulated"))
+            self.assertIn("[SIMULATED DEMO]", finding.get("title", ""))
+            self.assertNotIn("Users", finding.get("affected_resource", ""))
+
+    def test_demo_audit_does_not_claim_to_scan_the_visitor(self) -> None:
+        """Hosted demo must not imply it scanned the visitor's machine."""
+        _, _, body = self._invoke("GET", DEMO_AUDIT_PATH)
+        data = json.loads(body.decode("utf-8"))
+        blob = json.dumps(data).lower()
+
+        # The disclaimer must state the data is synthetic and not a live scan.
+        self.assertIn("synthetic", data["disclaimer"].lower())
+        self.assertIn("do not", data["disclaimer"].lower())
+
+        # No claim about scanning the visitor's own machine.
+        for phrase in ("your computer", "your machine", "your host", "your system", "scanned your"):
+            self.assertNotIn(phrase, blob, f"demo payload must not mention '{phrase}'")
+
+        # Any platform reference (e.g. a simulated kernel release string) must
+        # be explicitly qualified as simulated or demo, never presented as a
+        # real host that was scanned.
+        for match in re.finditer(r"kali|linux|windows", blob):
+            window = blob[max(0, match.start() - 48): match.end() + 48]
+            self.assertTrue(
+                "simulat" in window or "demo" in window,
+                f"unqualified platform claim near: {window!r}",
+            )
+
+    def test_demo_audit_head_returns_headers_without_body(self) -> None:
+        code, headers, body = self._invoke("HEAD", DEMO_AUDIT_PATH)
+        self.assertEqual(code, HTTPStatus.OK)
+        self.assertIn("application/json", headers.get("content-type", ""))
+        self.assertEqual(body, b"")
+
+    # -- history and unknown routes -------------------------------------
+
+    def test_history_route_returns_intentional_json_404(self) -> None:
+        code, headers, body = self._invoke("GET", HISTORY_PATH)
         self.assertEqual(code, HTTPStatus.NOT_FOUND)
         self.assertIn("application/json", headers.get("content-type", ""))
+        self._assert_security_headers(headers)
 
-        decoded = body.decode("utf-8")
-        self.assertNotIn("<!DOCTYPE html>", decoded)
-
-        data = json.loads(decoded)
-        self.assertEqual(data["status"], "NOT_FOUND")
-
-    def test_x_matched_path_is_not_used_for_routing(self) -> None:
-        """Regression: x-matched-path is a response header and must not drive routing.
-
-        Vercel documents x-matched-path as a Next.js response header. Reading it
-        from request headers previously masked a missing original path.
-        """
-        code, headers, body = self._invoke_handler(
-            "GET", "/api/index.py", headers={"x-matched-path": "/api/status"}
-        )
-
-        self.assertEqual(code, HTTPStatus.NOT_FOUND)
         data = json.loads(body.decode("utf-8"))
         self.assertEqual(data["status"], "NOT_FOUND")
-        self.assertNotEqual(data.get("service"), "LPE-Sentinel Cloud Portal")
+        self.assertEqual(data["error"], HISTORY_UNAVAILABLE_REASON)
+        self.assertIn("not implemented", data["error"])
 
-    def test_normal_dashboard_and_api_routing_preserved(self) -> None:
-        """Regression: normal routing is unchanged after the rewrite-destination fix."""
-        # Dashboard root still serves HTML.
-        code, headers, body = self._invoke_handler("GET", "/")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("text/html", headers.get("content-type", ""))
-        self.assertIn("<!DOCTYPE html>", body.decode("utf-8"))
+    def test_unknown_routes_return_consistent_json_404(self) -> None:
+        for path in ("/nope", "/api/unknown", "/api/status/extra", "/api/index.py", "/api/../etc"):
+            with self.subTest(path=path):
+                code, headers, body = self._invoke("GET", path)
+                self.assertEqual(code, HTTPStatus.NOT_FOUND)
+                self.assertIn("application/json", headers.get("content-type", ""))
+                self._assert_security_headers(headers)
+                self.assertEqual(json.loads(body.decode("utf-8"))["status"], "NOT_FOUND")
 
-        # Native function mount point still serves HTML.
-        for alias in ("/api", "/index.html"):
-            code, headers, body = self._invoke_handler("GET", alias)
-            self.assertEqual(code, HTTPStatus.OK, f"{alias} should serve dashboard")
-            self.assertIn("text/html", headers.get("content-type", ""))
+    def test_rewrite_destination_path_is_not_dashboard(self) -> None:
+        """Regression: the old catch-all destination must not serve the dashboard.
 
-        # API routes still serve JSON.
-        code, headers, body = self._invoke_handler("GET", "/api/status")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("application/json", headers.get("content-type", ""))
-        self.assertEqual(json.loads(body.decode("utf-8"))["status"], "ACTIVE")
-
-        code, headers, body = self._invoke_handler("GET", "/api/demo-audit")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("application/json", headers.get("content-type", ""))
-        self.assertTrue(json.loads(body.decode("utf-8"))["is_demo"])
-
-    def test_hosted_status_declares_unsupported_capabilities(self) -> None:
-        """Verify /api/status advertises cloud history and live audit as unsupported."""
-        status = get_hosted_status_payload()
-        caps = status["capabilities"]
-        self.assertFalse(caps["cloud_history"])
-        self.assertFalse(caps["live_audit"])
-        self.assertTrue(caps["demo_mode"])
-        self.assertTrue(status["deployment"]["is_hosted"])
-
-    def test_dashboard_contains_capability_gating_hooks(self) -> None:
-        """Verify the dashboard ships the capability-gating logic and honest messaging."""
-        html = render_dashboard_html()
-
-        # Gating is driven by the hosted flag only, so local behavior is untouched.
-        self.assertIn("deployment.is_hosted", html)
-        self.assertIn("resolveHostedCapabilities", html)
-        self.assertIn("applyHostedCapabilities", html)
-
-        # History short-circuits with an explicit message instead of erroring.
-        self.assertIn("Cloud audit history is unavailable in the hosted deployment", html)
-
-        # Live auditing is explained, not silently broken.
-        self.assertIn("Live auditing is unavailable in the hosted deployment", html)
-        self.assertIn("Live Auditing Unavailable", html)
-
-        # Targets the gating relies on must exist in the markup.
-        self.assertIn('id="btn-run-audit"', html)
-        self.assertIn('id="control-hint"', html)
-        self.assertIn('id="history-list"', html)
-
-    def test_local_dashboard_retains_live_audit_and_history_controls(self) -> None:
-        """Regression: the local dashboard must keep its live-audit and history UI.
-
-        Gating is applied only when /api/status reports deployment.is_hosted, which
-        the local server never sends, so these controls must still be rendered and
-        reachable in the shared template.
+        Serving HTML here silently broke every JSON endpoint on the hosted
+        deployment, because each one received HTML where JSON was expected.
         """
-        html = render_dashboard_html()
+        code, headers, body = self._invoke("GET", "/api/index.py")
+        self.assertEqual(code, HTTPStatus.NOT_FOUND)
+        self.assertNotIn("<!DOCTYPE html>", body.decode("utf-8"))
 
-        self.assertIn("async function runUnifiedAudit()", html)
-        self.assertIn("fetch('/api/run-audit'", html)
-        self.assertIn("fetch('/api/csrf-token')", html)
-        self.assertIn("fetch('/api/history?limit=10')", html)
-        self.assertIn('onclick="runUnifiedAudit()"', html)
-        self.assertIn('onclick="loadDemoAudit()"', html)
+    # -- method rejection -----------------------------------------------
 
-        # No fabricated host identity may appear in the shared template.
-        self.assertNotIn("SERVER_NAME", html)
+    def test_every_route_rejects_mutations(self) -> None:
+        """No hosted route may mutate state or trigger an audit."""
+        routes = ("/", "/api", STATUS_PATH, DEMO_AUDIT_PATH, HISTORY_PATH, "/unknown")
+        for route in routes:
+            for method in ("POST", "PUT", "PATCH", "DELETE"):
+                with self.subTest(route=route, method=method):
+                    code, headers, body = self._invoke(method, route)
+                    self.assertEqual(code, HTTPStatus.METHOD_NOT_ALLOWED)
+                    self.assertIn("application/json", headers.get("content-type", ""))
+                    self.assertEqual(
+                        json.loads(body.decode("utf-8"))["status"], "METHOD_NOT_ALLOWED"
+                    )
 
-    # ------------------------------------------------------------------
-    # Regression tests: server-rendered fail-closed capability baseline
-    # ------------------------------------------------------------------
+    # -- no original-path recovery --------------------------------------
+
+    def test_no_handler_recovers_original_url_from_rewrite(self) -> None:
+        """Guards the original root cause.
+
+        Routing now legitimately reads the request path, but it must never try to
+        reconstruct the URL from headers or rewrite destinations.
+        """
+        sources = {p.name: p.read_text(encoding="utf-8") for p in API_DIR.glob("*.py")}
+        sources["hosted.py"] = (SRC_DIR / "lpe_sentinel" / "web" / "hosted.py").read_text(
+            encoding="utf-8"
+        )
+        for name, text in sources.items():
+            with self.subTest(module=name):
+                self.assertNotIn("x-forwarded-uri", text)
+                self.assertNotIn("x-matched-path", text)
+
+    def test_hosted_code_exposes_no_scanning_or_persistence_surface(self) -> None:
+        """Hosted deployment must never reach scanners, shells, or SQLite."""
+        sources = {p.name: p.read_text(encoding="utf-8") for p in API_DIR.glob("*.py")}
+        sources["hosted.py"] = (SRC_DIR / "lpe_sentinel" / "web" / "hosted.py").read_text(
+            encoding="utf-8"
+        )
+
+        forbidden = (
+            "run_unified_audit",
+            "audit_engine",
+            "suid_sgid",
+            "sensitive_permissions",
+            "sudo_audit",
+            "subprocess",
+            "os.system",
+            "popen",
+            "eval(",
+            "exec(",
+            "sqlite3",
+            "AuditHistoryManager",
+            "audit_history",
+        )
+        for name, text in sources.items():
+            for token in forbidden:
+                with self.subTest(module=name, token=token):
+                    self.assertNotIn(token, text, f"{name} must not reference {token}")
+
+
+class TestHostedCapabilityGating(unittest.TestCase):
+    """Server-rendered fail-closed capability gating in the shared dashboard."""
 
     @staticmethod
     def _embedded_capabilities(html: str):
@@ -324,144 +331,9 @@ class TestVercelIntegrationStage1(unittest.TestCase):
         assert match, "capability baseline declaration not found in dashboard"
         return json.loads(match.group(1))
 
-    def test_local_dashboard_defaults_to_no_hosted_baseline(self) -> None:
-        """Zero-argument callers must keep a null (fully-capable) baseline."""
-        self.assertIsNone(self._embedded_capabilities(render_dashboard_html()))
-        self.assertIsNone(self._embedded_capabilities(render_dashboard_html(hosted=False)))
-
-    def test_zero_arg_call_is_backwards_compatible(self) -> None:
-        """The default argument must not change existing zero-arg call behavior."""
-        self.assertEqual(render_dashboard_html(), render_dashboard_html(hosted=False))
-
-    def test_hosted_dashboard_embeds_fail_closed_baseline(self) -> None:
-        """Hosted HTML must start gated without any /api/status response."""
-        caps = self._embedded_capabilities(render_dashboard_html(hosted=True))
-
-        self.assertIs(caps["isHosted"], True)
-        self.assertIs(caps["cloudHistory"], False)
-        self.assertIs(caps["liveAudit"], False)
-
-    def test_hosted_dashboard_serves_gated_baseline_over_http(self) -> None:
-        """Regression: the served hosted dashboard is gated before any status call."""
-        code, headers, body = self._invoke_handler("GET", "/")
-        self.assertEqual(code, HTTPStatus.OK)
-        self.assertIn("text/html", headers.get("content-type", ""))
-
-        caps = self._embedded_capabilities(body.decode("utf-8"))
-        self.assertIs(caps["isHosted"], True)
-        self.assertIs(caps["liveAudit"], False)
-        self.assertIs(caps["cloudHistory"], False)
-
-    def test_initialization_uses_baseline_not_failed_status_defaults(self) -> None:
-        """Regression: a failed status request must not widen capabilities.
-
-        initDashboard must seed from the server-rendered baseline rather than
-        synthesizing fully-capable defaults when /api/status is unavailable.
-        """
-        html = render_dashboard_html(hosted=True)
-
-        self.assertIn(
-            "let caps = resolveHostedCapabilities(null, hostedCapabilities);", html
-        )
-        self.assertNotIn("let caps = resolveHostedCapabilities(null);", html)
-        self.assertIn("caps = resolveHostedCapabilities(data, hostedCapabilities);", html)
-
-    def test_capability_baseline_serialized_safely(self) -> None:
-        """The embedded value must be JSON, not interpolated text."""
-        html = render_dashboard_html(hosted=True)
-
-        # No unreplaced placeholder may leak into the document.
-        self.assertNotIn("__INITIAL_CAPABILITIES__", html)
-
-        # Raw script-terminating characters must not appear in the embedded literal.
-        match = re.search(r"let hostedCapabilities = (.+?);", html)
-        self.assertIsNotNone(match)
-        literal = match.group(1)
-        self.assertNotIn("<", literal)
-        self.assertNotIn(">", literal)
-        self.assertNotIn("&", literal)
-
-        # And it must round-trip as JSON.
-        json.loads(literal)
-
-    def test_json_for_inline_script_escapes_breakout_characters(self) -> None:
-        """Verify the serializer neutralizes HTML/script breakout sequences."""
-        from lpe_sentinel.web.templates import _json_for_inline_script
-
-        serialized = _json_for_inline_script({"x": "</script><img src=x onerror=alert(1)>"})
-
-        self.assertNotIn("<", serialized)
-        self.assertNotIn(">", serialized)
-        self.assertIn("\\u003c", serialized)
-        self.assertIn("\\u003e", serialized)
-        # Value survives intact once parsed back.
-        self.assertEqual(
-            json.loads(serialized)["x"], "</script><img src=x onerror=alert(1)>"
-        )
-
-    def test_server_side_live_audit_remains_disabled(self) -> None:
-        """Regression: POST must stay rejected server-side regardless of UI gating.
-
-        UI gating is cosmetic; the authoritative boundary is the handler, which
-        must keep rejecting every mutation with 405.
-        """
-        code, headers, body = self._invoke_handler("POST", "/api/run-audit")
-
-        self.assertEqual(code, HTTPStatus.METHOD_NOT_ALLOWED)
-        self.assertIn("application/json", headers.get("content-type", ""))
-        self.assertEqual(json.loads(body.decode("utf-8"))["status"], "METHOD_NOT_ALLOWED")
-
-        # Any other mutation path is rejected too.
-        for method in ("POST", "PUT", "DELETE", "PATCH"):
-            inst = handler.__new__(handler)
-            inst.command = method
-            inst.path = "/api/status"
-            inst.headers = {}
-            inst.rfile = io.BytesIO()
-            inst.wfile = io.BytesIO()
-            inst.close_connection = False
-            response_code = [200]
-            inst.send_response = lambda c, m=None: response_code.__setitem__(0, int(c))
-            inst.send_header = lambda k, v: None
-            inst.end_headers = lambda: None
-
-            if hasattr(inst, "do_" + method):
-                getattr(inst, "do_" + method)()
-                self.assertEqual(
-                    response_code[0],
-                    HTTPStatus.METHOD_NOT_ALLOWED,
-                    f"{method} must be rejected",
-                )
-
-    def test_hosted_dashboard_does_not_enable_audit_endpoints(self) -> None:
-        """Hosted function must expose no live-audit or persistence capability."""
-        status = get_hosted_status_payload()
-
-        self.assertFalse(status["capabilities"]["live_audit"])
-        self.assertFalse(status["capabilities"]["cloud_history"])
-        self.assertFalse(status["capabilities"]["report_ingestion"])
-
-        # The hosted module must not import any scanning or persistence surface.
-        import api.index as vercel_module
-
-        source = Path(vercel_module.__file__).read_text(encoding="utf-8")
-        for forbidden in (
-            "run_unified_audit",
-            "audit_engine",
-            "subprocess",
-            "os.system",
-            "AuditHistoryManager",
-            "sqlite3",
-        ):
-            self.assertNotIn(forbidden, source, f"hosted function must not reference {forbidden}")
-
-    # ------------------------------------------------------------------
-    # Regression tests: hosted baseline is terminal (cannot be widened)
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _resolver_source(html: str) -> str:
-        """Extract the real resolveHostedCapabilities() implementation from the HTML."""
+        """Extract the real resolveHostedCapabilities() implementation."""
         start = html.index("function resolveHostedCapabilities")
         end = html.index("function disableElement")
         source = html[start:end].rstrip()
@@ -470,11 +342,7 @@ class TestVercelIntegrationStage1(unittest.TestCase):
         return source
 
     def _resolve(self, baseline, payload):
-        """Execute resolveHostedCapabilities() against a baseline and payload.
-
-        Uses the actual JS shipped in the dashboard so the assertion covers real
-        behavior rather than a reimplementation. Skipped when Node is absent.
-        """
+        """Execute resolveHostedCapabilities() against a baseline and payload."""
         node = shutil.which("node")
         if not node:
             self.skipTest("Node.js unavailable; skipping JS behavior verification")
@@ -495,15 +363,25 @@ class TestVercelIntegrationStage1(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, f"resolver failed: {proc.stderr}")
         return json.loads(proc.stdout.strip())
 
+    # -- baseline -------------------------------------------------------
+
+    def test_local_dashboard_defaults_to_no_hosted_baseline(self) -> None:
+        self.assertIsNone(self._embedded_capabilities(render_dashboard_html()))
+        self.assertIsNone(self._embedded_capabilities(render_dashboard_html(hosted=False)))
+
+    def test_zero_arg_call_is_backwards_compatible(self) -> None:
+        self.assertEqual(render_dashboard_html(), render_dashboard_html(hosted=False))
+
+    def test_hosted_dashboard_embeds_fail_closed_baseline(self) -> None:
+        caps = self._embedded_capabilities(render_dashboard_html(hosted=True))
+        self.assertIs(caps["isHosted"], True)
+        self.assertIs(caps["cloudHistory"], False)
+        self.assertIs(caps["liveAudit"], False)
+
+    # -- invariant ------------------------------------------------------
+
     def test_hosted_baseline_rejects_payload_claiming_both_capabilities(self) -> None:
-        """Regression: a hosted baseline must never be widened by a status payload.
-
-        Even a payload that explicitly asserts is_hosted, live_audit, and
-        cloud_history are all true must leave both capabilities disabled.
-        """
         baseline = self._embedded_capabilities(render_dashboard_html(hosted=True))
-        self.assertIs(baseline["isHosted"], True)
-
         result = self._resolve(
             baseline,
             {
@@ -511,15 +389,12 @@ class TestVercelIntegrationStage1(unittest.TestCase):
                 "capabilities": {"live_audit": True, "cloud_history": True},
             },
         )
-
         self.assertIs(result["isHosted"], True)
         self.assertIs(result["liveAudit"], False)
         self.assertIs(result["cloudHistory"], False)
 
     def test_hosted_baseline_stays_gated_across_payload_variants(self) -> None:
-        """A hosted baseline stays gated for missing, malformed, and locked payloads."""
         baseline = self._embedded_capabilities(render_dashboard_html(hosted=True))
-
         payloads = [
             None,
             {},
@@ -530,7 +405,6 @@ class TestVercelIntegrationStage1(unittest.TestCase):
             {"deployment": {"is_hosted": True}, "capabilities": {"live_audit": True}},
             {"deployment": {"is_hosted": True}, "capabilities": {"cloud_history": True}},
         ]
-
         for payload in payloads:
             with self.subTest(payload=payload):
                 result = self._resolve(baseline, payload)
@@ -538,33 +412,80 @@ class TestVercelIntegrationStage1(unittest.TestCase):
                 self.assertIs(result["cloudHistory"], False)
 
     def test_local_baseline_remains_fully_capable(self) -> None:
-        """Regression: a non-hosted baseline keeps local live audit and history."""
         baseline = self._embedded_capabilities(render_dashboard_html())
-        self.assertIsNone(baseline)
-
-        # Local server responses carry no `deployment` block.
         result = self._resolve(baseline, {"capabilities": {"demo_mode": True}})
-
         self.assertIs(result["isHosted"], False)
         self.assertIs(result["liveAudit"], True)
         self.assertIs(result["cloudHistory"], True)
 
-        # A null payload (failed status) must also leave local fully capable.
         fallback = self._resolve(baseline, None)
         self.assertIs(fallback["liveAudit"], True)
         self.assertIs(fallback["cloudHistory"], True)
 
     def test_hosted_lock_is_present_in_shipped_resolver(self) -> None:
-        """Structural guard so the invariant is enforced even without Node."""
-        html = render_dashboard_html(hosted=True)
-        resolver = self._resolver_source(html)
-
+        resolver = self._resolver_source(render_dashboard_html(hosted=True))
         self.assertIn("const hostedLocked = base.isHosted === true;", resolver)
         self.assertIn("cloudHistory: hostedLocked ? false : caps.cloud_history === true,", resolver)
         self.assertIn("liveAudit: hostedLocked ? false : caps.live_audit === true", resolver)
-
-        # The stale "never widened" claim must no longer appear.
         self.assertNotIn("never widened", resolver)
+
+    # -- initialization -------------------------------------------------
+
+    def test_initialization_uses_baseline_not_failed_status_defaults(self) -> None:
+        html = render_dashboard_html(hosted=True)
+        self.assertIn("let caps = resolveHostedCapabilities(null, hostedCapabilities);", html)
+        self.assertNotIn("let caps = resolveHostedCapabilities(null);", html)
+        self.assertIn("caps = resolveHostedCapabilities(data, hostedCapabilities);", html)
+
+    # -- safe serialization ---------------------------------------------
+
+    def test_capability_baseline_serialized_safely(self) -> None:
+        html = render_dashboard_html(hosted=True)
+        self.assertNotIn("__INITIAL_CAPABILITIES__", html)
+
+        match = re.search(r"let hostedCapabilities = (.+?);", html)
+        self.assertIsNotNone(match)
+        literal = match.group(1)
+        self.assertNotIn("<", literal)
+        self.assertNotIn(">", literal)
+        self.assertNotIn("&", literal)
+        json.loads(literal)
+
+    def test_json_for_inline_script_escapes_breakout_characters(self) -> None:
+        from lpe_sentinel.web.templates import _json_for_inline_script
+
+        serialized = _json_for_inline_script({"x": "</script><img src=x onerror=alert(1)>"})
+        self.assertNotIn("<", serialized)
+        self.assertNotIn(">", serialized)
+        self.assertIn("\\u003c", serialized)
+        self.assertIn("\\u003e", serialized)
+        self.assertEqual(
+            json.loads(serialized)["x"], "</script><img src=x onerror=alert(1)>"
+        )
+
+    # -- local preservation ----------------------------------------------
+
+    def test_local_dashboard_retains_live_audit_and_history_controls(self) -> None:
+        html = render_dashboard_html()
+        self.assertIn("async function runUnifiedAudit()", html)
+        self.assertIn("fetch('/api/run-audit'", html)
+        self.assertIn("fetch('/api/csrf-token')", html)
+        self.assertIn("fetch('/api/history?limit=10')", html)
+        self.assertIn('onclick="runUnifiedAudit()"', html)
+        self.assertIn('onclick="loadDemoAudit()"', html)
+        self.assertNotIn("SERVER_NAME", html)
+
+    def test_dashboard_contains_capability_gating_hooks(self) -> None:
+        html = render_dashboard_html()
+        self.assertIn("deployment.is_hosted", html)
+        self.assertIn("resolveHostedCapabilities", html)
+        self.assertIn("applyHostedCapabilities", html)
+        self.assertIn("Cloud audit history is unavailable in the hosted deployment", html)
+        self.assertIn("Live auditing is unavailable in the hosted deployment", html)
+        self.assertIn("Live Auditing Unavailable", html)
+        self.assertIn('id="btn-run-audit"', html)
+        self.assertIn('id="control-hint"', html)
+        self.assertIn('id="history-list"', html)
 
 
 if __name__ == "__main__":
