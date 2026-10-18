@@ -777,5 +777,176 @@ global.fetch=async(u)=>{ if(String(u).includes('/api/demo-audit'))
         )
 
 
+class TestImportControlHostedVisibility(unittest.TestCase):
+    """
+    The "Import Audit Report" control must be hidden on the hosted deployment.
+
+    Report import is a local-only capability: a serverless function has no
+    persistent storage and no authentication, so there is deliberately no upload
+    endpoint. Offering a button that can only ever fail is a user-visible defect.
+
+    These tests assert presentation only. The security boundary is unchanged and
+    still lives in handleReportFileSelected() plus the absence of any hosted
+    route, which are covered separately.
+    """
+
+    MARKUP_WRAPPER_ID = "report-import-controls"
+
+    def _wrapper_html(self) -> str:
+        html = render_dashboard_html()
+        start = html.index('id="' + self.MARKUP_WRAPPER_ID + '"')
+        start = html.rindex("<div", 0, start)
+        end = html.index("</div>", start)
+        return html[start:end]
+
+    # -- markup ----------------------------------------------------------
+    def test_import_controls_wrapper_is_identifiable(self) -> None:
+        """The wrapper must carry a stable id so it can be gated."""
+        html = render_dashboard_html()
+        self.assertIn('id="' + self.MARKUP_WRAPPER_ID + '"', html)
+
+    def test_wrapper_contains_label_input_and_status(self) -> None:
+        """The gated wrapper must still contain the whole import control."""
+        wrapper = self._wrapper_html()
+        self.assertIn('for="report-file-input"', wrapper)
+        self.assertIn('id="report-file-input"', wrapper)
+        self.assertIn('id="report-import-status"', wrapper)
+
+    # -- hosted rendering -------------------------------------------------
+    def test_hosted_page_embeds_hosted_capability_baseline(self) -> None:
+        """A hosted page must still default to isHosted=true."""
+        html = render_dashboard_html(hosted=True)
+        self.assertIn('"isHosted": true', html)
+        self.assertIn('"liveAudit": false', html)
+        self.assertIn('"cloudHistory": false', html)
+
+    def test_local_page_embeds_no_hosted_baseline(self) -> None:
+        """A local page must not claim hosted mode."""
+        html = render_dashboard_html(hosted=False)
+        self.assertNotIn('"isHosted": true', html)
+
+    # -- behavioural (executes the shipped JavaScript) --------------------
+    DOM_STUB = r"""
+function mkEl(id){ return { id, textContent:'', innerHTML:'', value:'', style:{}, className:'',
+  files:null, disabled:false, children:[], attrs:{},
+  classList:{ _s:new Set(), add(c){this._s.add(c)}, remove(c){this._s.delete(c)},
+              contains(c){return this._s.has(c)} },
+  appendChild(c){ this.children.push(c); },
+  setAttribute(k,v){ this.attrs[k]=String(v); },
+  removeAttribute(k){ delete this.attrs[k]; },
+  getAttribute(k){ return k in this.attrs ? this.attrs[k] : null; },
+  addEventListener(){}, focus(){}, click(){} }; }
+const store={};
+global.document={ getElementById(id){ if(!store[id]) store[id]=mkEl(id); return store[id]; },
+  querySelectorAll(){return[];}, querySelector(){return mkEl('q');},
+  createElement(t){return mkEl('c-'+t);}, addEventListener(){} };
+global.window={addEventListener(){},scrollTo(){}};
+global.alert=()=>{};
+global.fetch=async(u)=>({ok:true,json:async()=>({})});
+"""
+
+    SCENARIO = r"""
+(() => {
+  const out = {};
+  const el = document.getElementById('report-import-controls');
+
+  // Hosted: control must be hidden.
+  applyHostedCapabilities({ isHosted: true, liveAudit: false, cloudHistory: false });
+  out.hosted_display   = el.style.display;
+  out.hosted_hidden    = el.getAttribute('hidden');
+  out.hosted_aria      = el.getAttribute('aria-hidden');
+  out.hosted_caps      = hostedCapabilities.isHosted;
+
+  // Local: control must be restored and fully usable.
+  applyHostedCapabilities({ isHosted: false, liveAudit: true, cloudHistory: true });
+  out.local_display    = el.style.display === undefined ? 'undefined' : el.style.display;
+  out.local_hidden     = el.getAttribute('hidden');
+  out.local_aria       = el.getAttribute('aria-hidden');
+  out.local_caps       = hostedCapabilities.isHosted;
+
+  console.log('RESULT' + JSON.stringify(out));
+})();
+"""
+
+    def _run(self) -> dict:
+        import shutil
+        import subprocess
+        import tempfile
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("Node.js unavailable; skipping JS behaviour verification")
+
+        html = render_dashboard_html()
+        start = html.index("<script>") + len("<script>")
+        end = html.rindex("</script>")
+        js = html[start:end].replace("__INITIAL_CAPABILITIES__", "null")
+
+        program = self.DOM_STUB + "\n" + js + "\n" + self.SCENARIO
+        handle = tempfile.NamedTemporaryFile("w", suffix=".js", delete=False, encoding="utf-8")
+        try:
+            handle.write(program)
+            handle.close()
+            proc = subprocess.run(
+                [node, handle.name], capture_output=True, text=True, timeout=120
+            )
+        finally:
+            Path(handle.name).unlink(missing_ok=True)
+
+        self.assertEqual(proc.returncode, 0, f"node failed: {proc.stderr[-500:]}")
+        payload = None
+        for line in proc.stdout.splitlines():
+            if line.startswith("RESULT"):
+                payload = json.loads(line[len("RESULT") :])
+        self.assertIsNotNone(payload, f"no RESULT from node: {proc.stdout[-500:]}")
+        return payload
+
+    def test_control_is_hidden_when_hosted(self) -> None:
+        result = self._run()
+        self.assertEqual(result["hosted_display"], "none")
+        self.assertEqual(result["hosted_hidden"], "hidden")
+        self.assertEqual(result["hosted_aria"], "true")
+
+    def test_control_is_available_when_local(self) -> None:
+        result = self._run()
+        self.assertEqual(result["local_display"], "")
+        self.assertIsNone(result["local_hidden"])
+        self.assertIsNone(result["local_aria"])
+
+    def test_capabilities_object_is_unchanged_by_the_hiding(self) -> None:
+        """Hiding must not rewrite the capability flags themselves."""
+        result = self._run()
+        self.assertTrue(result["hosted_caps"])
+        self.assertFalse(result["local_caps"])
+
+    # -- defence in depth -------------------------------------------------
+    def test_handler_still_refuses_imports_in_hosted_mode(self) -> None:
+        """
+        The client-side guard in handleReportFileSelected must be preserved.
+
+        Hiding the control is presentation only; the runtime refusal is the
+        behaviour that actually protects the hosted deployment.
+        """
+        html = render_dashboard_html()
+        start = html.index("async function handleReportFileSelected(")
+        block = html[start:html.index("function clearDisplayedResults(")] \
+            if "function clearDisplayedResults(" in html[start:] else html[start:start + 2500]
+
+        self.assertIn("hostedCapabilities.isHosted", block)
+        self.assertIn(
+            "Report import is not available in the hosted deployment.",
+            block,
+        )
+
+    def test_hidden_control_does_not_disable_local_import_handler(self) -> None:
+        """The import handler must remain wired up in the local dashboard."""
+        html = render_dashboard_html(hosted=False)
+        self.assertIn(
+            'onchange="handleReportFileSelected(event)"',
+            html,
+        )
+        self.assertIn("async function handleReportFileSelected(", html)
+
+
 if __name__ == "__main__":
     unittest.main()

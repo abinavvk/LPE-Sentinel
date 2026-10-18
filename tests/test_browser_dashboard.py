@@ -213,10 +213,50 @@ def _empty_report() -> dict:
         },
         "summary": {
             "total_findings": 0,
-            "severity_counts": {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0},
+            "severity_counts": {
+                "INFO": 0,
+                "LOW": 0,
+                "MEDIUM": 0,
+                "HIGH": 0,
+                "CRITICAL": 0,
+            },
         },
         "system_info": {"hostname": "import-host", "os": "Linux 6.1.0-import"},
         "findings": [],
+    }
+
+
+def _report_with_findings() -> dict:
+    """A schema-valid report containing exactly one finding."""
+    return {
+        "report_metadata": {
+            "project_name": "LPE Sentinel",
+            "version": "0.0.0-test",
+            "format_version": "1.0",
+            "generated_at": "2026-01-01T00:00:00+00:00",
+        },
+        "summary": {
+            "total_findings": 1,
+            "severity_counts": {
+                "INFO": 0,
+                "LOW": 0,
+                "MEDIUM": 1,
+                "HIGH": 0,
+                "CRITICAL": 0,
+            },
+        },
+        "system_info": {"hostname": "import-host", "os": "Linux 6.1.0-import"},
+        "findings": [
+            {
+                "finding_id": "IMP-0001",
+                "title": "Imported finding for browser regression testing",
+                "severity": "MEDIUM",
+                "description": "A single finding imported from a report file.",
+                "evidence": "imported",
+                "affected_resource": "/etc/imported.conf",
+                "recommendation": "Review the imported finding.",
+            }
+        ],
     }
 
 
@@ -277,6 +317,37 @@ ACTIVE_STYLE_JS = """
   if (!el) return null;
   const cs = getComputedStyle(el);
   return { borderColor: cs.borderColor, background: cs.backgroundColor };
+})()
+"""
+
+# Visibility of the "Import Audit Report" control, measured in the real DOM so
+# the inline flex layout and the hidden attribute are both honoured by the
+# browser rather than by a stub.
+IMPORT_CONTROL_JS = """
+(() => {
+  const el = document.getElementById('report-import-controls');
+  const input = document.getElementById('report-file-input');
+  return {
+    exists: !!el,
+    display: el ? getComputedStyle(el).display : null,
+    hiddenAttr: el ? el.hasAttribute('hidden') : null,
+    inputExists: !!input,
+    inputAccept: input ? input.accept : null
+  };
+})()
+"""
+
+FORCE_HOSTED_CAPS_JS = """
+(() => {
+  applyHostedCapabilities({ isHosted: true, liveAudit: false, cloudHistory: false });
+  return 'hosted-applied';
+})()
+"""
+
+FORCE_LOCAL_CAPS_JS = """
+(() => {
+  applyHostedCapabilities({ isHosted: false, liveAudit: true, cloudHistory: true });
+  return 'local-applied';
 })()
 """
 
@@ -512,6 +583,9 @@ class TestDashboardInRealChrome(unittest.TestCase):
         self.assertEqual(snapshot["jsFindings"], 0)
         self.assertEqual(snapshot["countTotal"], "0")
         self.assertEqual(snapshot["findingsRows"], 1)
+        # Assert the actual success transition. A message-absence check would
+        # pass even if the server had rejected the report.
+        self.assertEqual(snapshot["sessionStatus"], "IMPORTED REPORT")
         self.assertNotIn(
             "Invalid",
             snapshot["importStatus"],
@@ -531,6 +605,71 @@ class TestDashboardInRealChrome(unittest.TestCase):
         )
         snapshot = result[-1]
         self.assertEqual(snapshot["jsFindings"], 1)
+
+    # -- report import control visibility ---------------------------------
+    def test_import_control_is_visible_on_local_dashboard(self):
+        """Locally the import control must be present and rendered."""
+        control = self.run_job([{"expr": IMPORT_CONTROL_JS}])[0]
+        self.assertTrue(control["exists"])
+        self.assertTrue(control["inputExists"])
+        self.assertNotEqual(control["display"], "none")
+        self.assertFalse(control["hiddenAttr"])
+        self.assertIn("json", control["inputAccept"])
+
+    def test_import_control_is_hidden_when_hosted(self):
+        """Applying hosted capabilities must hide the import control."""
+        values = self.run_job(
+            [
+                {"expr": IMPORT_CONTROL_JS},
+                {"expr": FORCE_HOSTED_CAPS_JS},
+                {"expr": IMPORT_CONTROL_JS},
+                {"expr": FORCE_LOCAL_CAPS_JS},
+                {"expr": IMPORT_CONTROL_JS},
+            ]
+        )
+        local_before, hosted, local_after = values[0], values[2], values[4]
+        self.assertNotEqual(local_before["display"], "none")
+
+        self.assertEqual(hosted["display"], "none")
+        self.assertTrue(hosted["hiddenAttr"])
+
+        # Restoring local capabilities must bring the control straight back.
+        self.assertNotEqual(local_after["display"], "none")
+        self.assertFalse(local_after["hiddenAttr"])
+
+    def test_local_import_still_works_after_a_hosted_toggle(self):
+        """
+        Toggling to hosted and back must not break local report import.
+
+        Guards against the visibility change accidentally disabling the local
+        workflow or leaving the file input unusable.
+        """
+        values = self.run_job(
+            [
+                {"expr": FORCE_HOSTED_CAPS_JS},
+                {"expr": FORCE_LOCAL_CAPS_JS},
+                {"expr": IMPORT_CONTROL_JS},
+                {
+                    "expr": import_file_js(
+                        json.dumps(_report_with_findings()), "findings.json"
+                    ),
+                    "await": True,
+                },
+                {"expr": SNAPSHOT_JS},
+            ]
+        )
+        control = values[2]
+        snapshot = values[-1]
+        self.assertNotEqual(control["display"], "none")
+        self.assertEqual(snapshot["jsFindings"], 1)
+        self.assertEqual(snapshot["countTotal"], "1")
+        self.assertEqual(
+            snapshot["sessionStatus"],
+            "IMPORTED REPORT",
+            "the import must genuinely succeed, not merely avoid an error",
+        )
+        self.assertFalse(snapshot["demoBannerVisible"])
+        self.assertNotIn("Invalid", snapshot["importStatus"])
 
 
 if __name__ == "__main__":

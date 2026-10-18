@@ -1471,7 +1471,7 @@ def render_dashboard_html(hosted: bool = False) -> str:
           <svg viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
           Load Demo Audit
         </button>
-        <div style="display:flex; flex-direction:column; gap:0.4rem;">
+        <div id="report-import-controls" style="display:flex; flex-direction:column; gap:0.4rem;">
           <label class="btn btn-secondary" for="report-file-input" style="margin:0;">
             <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
             Import Audit Report
@@ -2057,6 +2057,26 @@ def render_dashboard_html(hosted: bool = False) -> str:
 
     function applyHostedCapabilities(caps) {
       hostedCapabilities = caps;
+
+      // Report import is a local-only capability. A serverless function has no
+      // persistent storage and no authentication, so there is deliberately no
+      // upload endpoint on the hosted deployment. Hide the control entirely
+      // rather than offering a button that can only ever fail. Local mode keeps
+      // the full import workflow unchanged. handleReportFileSelected retains its
+      // own hosted guard, so this is presentation only and not the security
+      // boundary.
+      const importControls = document.getElementById('report-import-controls');
+      if (importControls) {
+        if (caps.isHosted === true) {
+          importControls.style.display = 'none';
+          importControls.setAttribute('hidden', 'hidden');
+          importControls.setAttribute('aria-hidden', 'true');
+        } else {
+          importControls.style.display = '';
+          importControls.removeAttribute('hidden');
+          importControls.removeAttribute('aria-hidden');
+        }
+      }
 
       if (caps.liveAudit) {
         const btn = document.getElementById('btn-run-audit');
