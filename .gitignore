@@ -77,3 +77,5 @@ scratch/
 # Generated Audit Reports (keep tracked placeholder)
 reports/*
 !reports/.gitkeep
+
+.vercel

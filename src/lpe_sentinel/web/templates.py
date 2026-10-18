@@ -1471,6 +1471,14 @@ def render_dashboard_html(hosted: bool = False) -> str:
           <svg viewBox="0 0 24 24"><path d="M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5zm0-8c-1.66 0-3 1.34-3 3s1.34 3 3 3 3-1.34 3-3-1.34-3-3-3z"/></svg>
           Load Demo Audit
         </button>
+        <div id="report-import-controls" style="display:flex; flex-direction:column; gap:0.4rem;">
+          <label class="btn btn-secondary" for="report-file-input" style="margin:0;">
+            <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+            Import Audit Report
+          </label>
+          <input type="file" id="report-file-input" accept="application/json,.json" style="display:none;" onchange="handleReportFileSelected(event)">
+          <span id="report-import-status" style="font-size:0.72rem; color:var(--text-dim); text-align:center;">Reads a JSON report produced by the CLI on another machine.</span>
+        </div>
         <button type="button" class="btn btn-primary" id="btn-run-audit" onclick="runUnifiedAudit()">
           <svg viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
           Run Unified Audit
@@ -1750,6 +1758,15 @@ def render_dashboard_html(hosted: bool = False) -> str:
     let comparisonData = null;
     let activeComparisonTab = 'ALL';
     let hostedCapabilities = __INITIAL_CAPABILITIES__;
+
+    // Custom empty-state message used when the current dataset legitimately
+    // contains zero findings (e.g. a valid imported report that recorded none).
+    // When null, a zero-row table is interpreted as "filters hid everything".
+    let emptyStateMessage = null;
+
+    function setEmptyStateMessage(message) {
+      emptyStateMessage = message || null;
+    }
 
     function setSessionStatus(stateClass, label) {
       const pill = document.getElementById('session-status');
@@ -2041,6 +2058,26 @@ def render_dashboard_html(hosted: bool = False) -> str:
     function applyHostedCapabilities(caps) {
       hostedCapabilities = caps;
 
+      // Report import is a local-only capability. A serverless function has no
+      // persistent storage and no authentication, so there is deliberately no
+      // upload endpoint on the hosted deployment. Hide the control entirely
+      // rather than offering a button that can only ever fail. Local mode keeps
+      // the full import workflow unchanged. handleReportFileSelected retains its
+      // own hosted guard, so this is presentation only and not the security
+      // boundary.
+      const importControls = document.getElementById('report-import-controls');
+      if (importControls) {
+        if (caps.isHosted === true) {
+          importControls.style.display = 'none';
+          importControls.setAttribute('hidden', 'hidden');
+          importControls.setAttribute('aria-hidden', 'true');
+        } else {
+          importControls.style.display = '';
+          importControls.removeAttribute('hidden');
+          importControls.removeAttribute('aria-hidden');
+        }
+      }
+
       if (caps.liveAudit) {
         const btn = document.getElementById('btn-run-audit');
         if (btn) btn.disabled = false;
@@ -2081,6 +2118,190 @@ def render_dashboard_html(hosted: bool = False) -> str:
       loadRecentAudits();
     }
 
+    // Import a previously generated audit report (local dashboard only).
+    //
+    // The browser reads the chosen file with FileReader and posts its text as the
+    // request body. No filesystem path is ever sent to the server, and the server
+    // never reads or executes a file. Import is unavailable in hosted mode.
+    let importedReportText = null;
+
+    function setReportImportStatus(message, tone) {
+      const el = document.getElementById('report-import-status');
+      if (!el) return;
+      el.textContent = message;
+      if (tone === 'error') el.style.color = 'var(--severity-crit)';
+      else if (tone === 'ok') el.style.color = 'var(--severity-info)';
+      else el.style.color = 'var(--text-dim)';
+    }
+
+    // Discard every currently displayed result.
+    //
+    // Used when an import attempt fails, so stale demo/import/live findings can
+    // never be mistaken for the outcome of the attempted import. Provenance
+    // banners are cleared too, and filters are reset so the cleared table shows
+    // the neutral empty state rather than a filter-empty message.
+    function clearDisplayedResults() {
+      currentFindings = [];
+      currentHistoryScanId = null;
+      isDemoMode = false;
+      comparisonData = null;
+      closeComparison();
+
+      const demoBanner = document.getElementById('demo-banner');
+      if (demoBanner) demoBanner.classList.remove('visible');
+      hideLiveBanner();
+      hideHistoryBanner();
+
+      // Drop the "currently loaded" marker from the saved-history list. Only
+      // the transient highlight is removed; the stored audit records, their
+      // list entries, and the record count are left untouched.
+      document.querySelectorAll('.history-item').forEach(it => it.classList.remove('active'));
+
+      resetAllFilters();
+      setEmptyStateMessage('No results are currently loaded. Import an audit report, load the demo audit, or run a local audit.');
+      updateSummaryCounts({ total_findings: 0, severity_counts: {} });
+      renderFindingsTable();
+      setSessionStatus('', 'NO RESULTS');
+    }
+
+    // Report a failed import and discard anything previously displayed.
+    function failImport(message) {
+      clearDisplayedResults();
+      setReportImportStatus(message, 'error');
+    }
+
+    async function handleReportFileSelected(event) {
+      const input = event && event.target;
+      const file = input && input.files ? input.files[0] : null;
+      // Picker dismissed with no selection: leave the dashboard untouched.
+      if (!file) return;
+
+      if (hostedCapabilities && hostedCapabilities.isHosted) {
+        if (input) input.value = '';
+        failImport('Report import is not available in the hosted deployment.');
+        return;
+      }
+
+      setReportImportStatus('Reading ' + file.name + '…', 'pending');
+
+      let text;
+      try {
+        text = await file.text();
+      } catch (err) {
+        if (input) input.value = '';
+        failImport('Could not read the selected file: ' + escapeHtml(err.message));
+        return;
+      }
+
+      // Pre-parse client-side only to give a fast, friendly error. The server
+      // re-validates the entire report regardless of what the browser checks.
+      try {
+        JSON.parse(text);
+      } catch (err) {
+        if (input) input.value = '';
+        failImport('That file is not valid JSON. Select a report generated by the LPE-Sentinel CLI.');
+        return;
+      }
+
+      if (text.length > 60000) {
+        if (input) input.value = '';
+        failImport('Report is too large (max 60 KB). Select a smaller report file.');
+        return;
+      }
+
+      try {
+        // 1. CSRF token
+        let csrfToken = '';
+        try {
+          const csrfRes = await fetch('/api/csrf-token');
+          if (csrfRes.ok) {
+            const csrfData = await csrfRes.json();
+            csrfToken = csrfData.csrf_token || '';
+          }
+        } catch (tokenErr) {
+          console.warn('Failed to retrieve CSRF token:', tokenErr);
+        }
+
+        // 2. Send the report as the request body
+        const res = await fetch('/api/import-report', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+          body: text
+        });
+
+        const data = await res.json().catch(() => ({}));
+
+        if (!res.ok) {
+          const details = Array.isArray(data.validation_errors) && data.validation_errors.length
+            ? ' (' + data.validation_errors.length + ' problem' + (data.validation_errors.length === 1 ? '' : 's') + ' found)'
+            : '';
+          failImport((data.error || 'Import failed (HTTP ' + res.status + ')') + details);
+          return;
+        }
+
+        renderImportedReport(data);
+      } catch (err) {
+        failImport('Import failed: ' + escapeHtml(err.message));
+      } finally {
+        if (input) input.value = '';
+      }
+    }
+
+    function renderImportedReport(data) {
+      const findings = data.findings || [];
+      currentHistoryScanId = null;
+      isDemoMode = false;
+      currentFindings = findings;
+
+      document.getElementById('demo-banner').classList.remove('visible');
+      hideLiveBanner();
+      hideHistoryBanner();
+      closeComparison();
+
+      // A successful import starts from a clean view: reset filters and sorting
+      // so a newly loaded report is never hidden behind a previous filter state.
+      resetAllFilters();
+
+      const meta = data.report_metadata || {};
+      const sys = data.system_info || {};
+      const stamp = meta.generated_at ? String(meta.generated_at).replace('T', ' ').replace('+00:00', ' UTC') : 'unknown time';
+
+      setSessionStatus('active-history', 'IMPORTED REPORT');
+
+      // Distinguish "the report genuinely recorded nothing" from "filters hid
+      // everything", so an empty result is never reported as a filter problem.
+      if (findings.length === 0) {
+        setEmptyStateMessage(
+          'The audit report imported successfully and recorded 0 findings. ' +
+          'This means the audited system had nothing matching the enabled checks — not that the system is secure.'
+        );
+        setReportImportStatus('Imported a valid report with 0 findings.', 'ok');
+      } else {
+        setEmptyStateMessage(null);
+        setReportImportStatus(
+          'Imported ' + findings.length + ' finding' + (findings.length === 1 ? '' : 's') + ' from ' +
+          (sys.hostname || 'an unnamed host') + '. Not a live scan.',
+          'ok'
+        );
+      }
+
+      if (data.system_info) updateSystemInfoDisplay(sys);
+
+      // Make the provenance unmistakable in the main banner area.
+      const banner = document.getElementById('history-banner');
+      if (banner) {
+        document.getElementById('history-banner-title').textContent = '📄 IMPORTED AUDIT REPORT (NOT A LIVE SCAN)';
+        document.getElementById('history-banner-desc').textContent =
+          'Results generated by the LPE-Sentinel CLI on ' + (sys.hostname || 'an unnamed host') +
+          ' (' + (sys.os_name || 'unknown OS') + ') at ' + stamp +
+          '. This dashboard did not scan this machine, and cannot verify the file.';
+        banner.classList.add('visible');
+      }
+
+      if (data.summary) updateSummaryCounts(data.summary);
+      renderFindingsTable();
+    }
+
     // Load Demo Audit Data
     async function loadDemoAudit() {
       try {
@@ -2088,6 +2309,7 @@ def render_dashboard_html(hosted: bool = False) -> str:
         hideLiveBanner();
         hideHistoryBanner();
         document.querySelectorAll('.history-item').forEach(it => it.classList.remove('active'));
+        setEmptyStateMessage(null);
 
         const res = await fetch('/api/demo-audit');
         if (!res.ok) throw new Error('Failed to fetch demo data');
@@ -2162,6 +2384,7 @@ def render_dashboard_html(hosted: bool = False) -> str:
       const demoBanner = document.getElementById('demo-banner');
       if (demoBanner) demoBanner.classList.remove('visible');
       currentFindings = [];
+      setEmptyStateMessage(null);
       renderFindingsTable();
       updateSummaryCounts({ total_findings: 0, severity_counts: {} });
 
@@ -2283,6 +2506,7 @@ def render_dashboard_html(hosted: bool = False) -> str:
           );
         }
 
+        setEmptyStateMessage(null);
         renderFindingsTable();
         // Refresh persistent history list after live audit completion
         loadRecentAudits();
@@ -2460,6 +2684,9 @@ def render_dashboard_html(hosted: bool = False) -> str:
       const searchInput = document.getElementById('search-input');
       if (searchInput) searchInput.value = '';
 
+      // A manual reset returns to the neutral view, so drop any dataset-specific
+      // empty message that described a particular report or result set.
+      setEmptyStateMessage(null);
       renderFindingsTable();
     }
 
@@ -2547,7 +2774,20 @@ def render_dashboard_html(hosted: bool = False) -> str:
 
       if (filtered.length === 0) {
         const emptyTr = document.createElement('tr');
-        emptyTr.innerHTML = `
+        // A dataset-specific message (e.g. a valid report with zero findings)
+        // takes priority over the generic filter explanation.
+        if (emptyStateMessage) {
+          emptyTr.innerHTML = `
+            <td colspan="6">
+              <div class="empty-state">
+                <svg viewBox="0 0 24 24"><path d="M9 16h6v-6h4l-7-7-7 7h4v6zm-4 2h14v2H5v-2z"/></svg>
+                <h3>No Findings</h3>
+                <p>${escapeHtml(emptyStateMessage)}</p>
+              </div>
+            </td>
+          `;
+        } else {
+          emptyTr.innerHTML = `
           <td colspan="6">
             <div class="empty-state">
               <svg viewBox="0 0 24 24"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
@@ -2559,6 +2799,7 @@ def render_dashboard_html(hosted: bool = False) -> str:
             </div>
           </td>
         `;
+        }
         tbody.appendChild(emptyTr);
         return;
       }

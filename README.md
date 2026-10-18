@@ -122,7 +122,31 @@ python src/lpe_sentinel/web_app.py --port 8765 --open-browser
 - **Live Audit Mode (`POST /api/run-audit`)**: Triggers the non-interactive unified scanner engine. Supported only on Linux systems; non-Linux hosts receive a clean platform warning (`UNSUPPORTED_PLATFORM`).
 - **Audit History & Comparison**: Live audits are automatically persisted to a local SQLite database (`~/.lpe_sentinel/audit_history.db`). Past audits can be reloaded (`GET /api/history/<scan_id>`), compared side-by-side (`GET /api/history/compare?older=<id>&newer=<id>`), and exported.
 
-### 4. Report Exports:
+### 4. Importing a Report From Another Machine:
+
+The dashboard can display an audit report produced earlier by the CLI, so results from a remote Linux host can be reviewed locally without exposing the dashboard to the network.
+
+```bash
+# 1. On the Linux target, run the CLI and use [3] Generate Report
+#    (from the project root on that machine)
+python src/lpe_sentinel/main.py
+
+# 2. Copy the generated JSON file (e.g. reports/security-report.json) to this machine
+
+# 3. Start the local dashboard here (from the project root)
+python src/lpe_sentinel/web_app.py --port 8080
+
+# 4. Open http://127.0.0.1:8080 and click "Import Audit Report", selecting the JSON file
+```
+
+- **The browser reads the file and posts its contents** to `POST /api/import-report`. No filesystem path is ever sent to the server, and the server never opens, reads, or executes a file.
+- The report is re-validated in full server-side (`report_validation.validate_report_data`), and the response is rebuilt from an explicit allow-list, so unknown fields are discarded.
+- Limits and protections match the rest of the API: 64 KB body cap, JSON content-type check, Origin check, and CSRF token. Only `POST` is accepted.
+- **Imported results are always labelled**: `source: local_report`, `is_live_scan: false`, `verification_status: unverified`. They keep the **original report's host, OS, and timestamp**. The report format has no signature, so the dashboard cannot prove authenticity and must never present an import as a live scan.
+- A valid report containing **0 findings** reports "imported successfully and recorded 0 findings" rather than a filter message. A **failed import clears** any previously displayed demo/import/live results so they cannot be mistaken for the import outcome.
+- **Not available in the hosted Vercel deployment.** A serverless function has no persistent storage and no authentication, so there is deliberately no upload endpoint; viewing real results requires the local dashboard.
+
+### 5. Report Exports:
 
 Audit reports can be exported in three secure formats from saved records without re-running scanners:
 - **JSON (`GET /api/history/<scan_id>/export/json`)**: Schema-validated machine-readable audit report.
@@ -152,6 +176,32 @@ python -m pytest -q
 # Run with standard library unittest
 python -m unittest discover tests
 ```
+
+### Optional Real-Browser Dashboard Tests
+
+Most dashboard logic is covered by fast unit tests. A small set of behaviours —
+the history highlight, clearing stale results after a failed import, and the
+zero-findings case — can only be confirmed in a real browser, because they
+depend on rendered CSS and real DOM events.
+
+These tests are **opt-in and skipped by default**. They drive a headless Chrome
+over the DevTools Protocol using only Node.js built-ins, so **no packages are
+installed and no runtime dependency is added**. They skip with a clear message
+if Chrome or a modern Node.js is unavailable.
+
+```bash
+# Windows PowerShell
+$env:LPE_BROWSER_TESTS = "1"
+python -m unittest tests.test_browser_dashboard -v
+
+# macOS / Linux
+LPE_BROWSER_TESTS=1 python -m unittest tests.test_browser_dashboard -v
+```
+
+The browser runs against a throwaway SQLite database and a temporary Chrome
+profile, both created in a temp directory and removed afterwards. Your real
+`~/.lpe_sentinel/audit_history.db` and your normal browser profile are never
+touched.
 
 ---
 
